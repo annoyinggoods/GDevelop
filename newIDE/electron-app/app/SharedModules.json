@@ -1,0 +1,8 @@
+[
+  "Utils/LocalFileDownloadCore.js",
+  "AiGeneration/Byok/ByokAtomicWriteCore.js",
+  "AiGeneration/Byok/GameCode/ByokGameCodePathCore.js",
+  "AiGeneration/Byok/Rag/ByokQdrantSetupCore.js",
+  "AiGeneration/Byok/ByokResourceDownloader.js",
+  "Fork/AssetPipeline/ForkAssetIndexCore.js"
+]

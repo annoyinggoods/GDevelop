@@ -1,0 +1,1180 @@
+const electron = require('electron');
+const path = require('path');
+const fs = require('fs');
+const child_process = require('child_process');
+const app = electron.app; // Module to control application life.
+const BrowserWindow = electron.BrowserWindow; // Module to create native browser window.
+const Menu = electron.Menu;
+const Notification = electron.Notification;
+const protocol = electron.protocol;
+const isDev = require('electron-is-dev');
+const ipcMain = electron.ipcMain;
+const autoUpdater = require('electron-updater').autoUpdater;
+const log = require('electron-log');
+const { uploadLocalFile } = require('./LocalFileUploader');
+const { serveFolder, stopServer, stopAllServers } = require('./ServeFolder');
+const {
+  startDebuggerServer,
+  sendMessage,
+  closeAllConnections,
+  closeServer: closeDebuggerServer,
+  stopAllServers: stopAllDebuggerServers,
+} = require('./DebuggerServer');
+const {
+  buildElectronMenuFromDeclarativeTemplate,
+  buildPlaceholderMainMenu,
+} = require('./MainMenu');
+const { loadExternalEditorWindow } = require('./LocalExternalEditorWindow');
+const { load, registerGdideProtocol } = require('./Utils/UrlLoader');
+const { setupMcpStdioPipe } = require('./CliMcpServerPipe');
+const { waitForPreviousCliInstance } = require('./CliInstanceLock');
+const {
+  createLiveMcpServer,
+  makeLiveMcpServerSettingsStore,
+} = require('./LiveMcpServer');
+const throttle = require('lodash.throttle');
+const { findLocalIp } = require('./Utils/LocalNetworkIpFinder');
+const setUpDiscordRichPresence = require('./DiscordRichPresence');
+const {
+  downloadLocalFile,
+  saveLocalFileFromArrayBuffer,
+} = require('./LocalFileDownloader');
+const {
+  openPreviewWindow,
+  closePreviewWindow,
+  closePreviewWindowsForParent,
+  closeAllPreviewWindows,
+  getPreviewWindows,
+} = require('./PreviewWindow');
+const {
+  setupLocalGDJSDevelopmentWatcher,
+  closeLocalGDJSDevelopmentWatcher,
+  onLocalGDJSDevelopmentWatcherRuntimeUpdated,
+} = require('./LocalGDJSDevelopmentWatcher');
+const { setupWatcher, disableWatcher } = require('./LocalFilesystemWatcher');
+const { installCliInPath } = require('./InstallCliInPath');
+const {
+  isByokEncryptionAvailable,
+  encryptByokSecret,
+  decryptByokSecret,
+} = require('./ByokSafeStorage');
+const { readByokUserSkills } = require('./ByokUserSkills');
+const { registerByokChatFileHandlers } = require('./ByokChatFiles');
+const { registerByokMcpServer } = require('./ByokMcpServer');
+const { registerByokRagFileHandlers } = require('./ByokRagFiles');
+const { registerByokResourceDownload } = require('./ByokResourceDownload');
+const { registerByokGameCodeFiles } = require('./ByokGameCode');
+// Phase 16.2: the build-time asset optimizer applier (desktop-only, opt-in).
+const { registerForkAssetOptimizer } = require('./ForkAssetOptimizer');
+// Phase 19.2: the sprite-sheet slicer (confined, never-overwriting writes).
+const { registerForkSpriteSheetSlicer } = require('./ForkSpriteSheet');
+// Phase 17.2: the fork asset-index sidecar IPC (confined to the project folder).
+const { registerForkAssetIndexFiles } = require('./ForkAssetIndex');
+const {
+  ensureStarted: ensureByokQdrantStarted,
+  registerByokQdrant,
+  stopByokQdrantForExit,
+} = require('./ByokQdrant');
+const {
+  setWindowFileIdentifier,
+  clearWindowFileIdentifier,
+} = require('./OpenProjectsRegistry');
+const {
+  parseGDevelopArgs,
+  parseSecondInstanceArgs,
+  isCliProjectAlreadyOpenElsewhere,
+  routeCliCommandToLiveEditor,
+} = require('./CliCommandHandoff');
+
+// Initialize `@electron/remote` module
+require('@electron/remote/main').initialize();
+
+const args = parseGDevelopArgs(process.argv.slice(isDev ? 2 : 1));
+// `--mcp`: serve the editor functions of the project on stdin/stdout, in its
+// own (headless) process, until the MCP client closes stdin.
+if (args['mcp']) args['run-command'] = 'SERVE_MCP';
+// With `--mcp` or `--json`, stdout only holds the output of the command: the
+// logs of the main process (including electron-log's) go to stderr.
+if (args['mcp'] || args['json']) {
+  const writeToStderr = (...values) =>
+    process.stderr.write(require('util').format(...values) + '\n');
+  console.log = writeToStderr;
+  console.info = writeToStderr;
+  console.debug = writeToStderr;
+  const stderrLogTransport = message => writeToStderr(...message.data);
+  stderrLogTransport.level = 'info';
+  log.transports.console.level = false;
+  log.transports.stderr = stderrLogTransport;
+}
+
+log.info('GDevelop Electron app starting...');
+
+// Logs made with electron-logs can be found
+// on Linux: ~/.config/<app name>/log.log
+// on OS X: ~/Library/Logs/<app name>/log.log
+// on Windows: %USERPROFILE%\AppData\Roaming\<app name>\log.log
+autoUpdater.logger = log;
+autoUpdater.logger.transports.file.level = 'info';
+autoUpdater.autoDownload = false;
+
+// Keep a global reference of the window objects, if you don't, the windows will
+// be closed automatically when the JavaScript object is garbage collected.
+let mainWindows = new Set();
+let mainWindow = null; // Primary window reference for backwards compatibility
+let windowCounter = 0; // Counter for creating unique session partitions
+// The window an agent connecting to the live MCP server is bound to.
+let lastFocusedMainWindow = null;
+let liveMcpServer = null;
+
+const devTools = !!args['dev-tools'];
+
+// See registerGdideProtocol (used for HTML modules support)
+protocol.registerSchemesAsPrivileged([{ scheme: 'gdide' }]);
+
+// On computers having an integrated and a discrete graphics card (most gaming
+// laptops), Chromium uses the integrated one by default: the 3D editor and the
+// previews would run a lot slower than they could. Must be set before the app is ready.
+app.commandLine.appendSwitch('force_high_performance_gpu');
+
+// Notifications on Microsoft Windows platforms show the app user model id.
+// If not set, defaults to `electron.app.{app.name}`.
+if (process.platform === 'win32') {
+  app.setAppUserModelId('gdevelop.ide');
+}
+
+// Single instance lock - prevents multiple Electron processes
+// This solves Firebase IndexedDB locking issues while still allowing multiple windows.
+// CLI: skip the lock unless the target project is a known open window (registry hit);
+// a stale registry entry falls back to running headless in this process.
+const isCliRunCommand = !!args['run-command'];
+const gotTheLock =
+  isCliRunCommand && (args['mcp'] || !isCliProjectAlreadyOpenElsewhere(args))
+    ? true
+    : app.requestSingleInstanceLock({ args });
+
+if (!gotTheLock) {
+  // Second instance attempted - quit immediately
+  app.quit();
+} else {
+  app.on(
+    'second-instance',
+    (event, commandLine, workingDirectory, additionalData) => {
+      const secondInstanceArgs = parseSecondInstanceArgs({
+        commandLine,
+        additionalData,
+        isDev,
+      });
+
+      if (
+        routeCliCommandToLiveEditor({
+          parsedArgs: secondInstanceArgs,
+          mainWindows,
+        })
+      ) {
+        return;
+      }
+
+      // Update the global args so the new window's renderer (which reads them
+      // via remote.getGlobal('args')) picks up the second-instance CLI flags
+      // (e.g. --run-command, positional project file).
+      global['args'] = secondInstanceArgs;
+
+      createNewWindow(secondInstanceArgs);
+    }
+  );
+}
+
+// Quit when all windows are closed.
+app.on('window-all-closed', function() {
+  // Best-effort cleanup - ignore any errors to prevent crashes during shutdown
+  try {
+    stopAllServers();
+  } catch (e) {
+    // Ignore errors during shutdown
+  }
+  try {
+    stopAllDebuggerServers();
+  } catch (e) {
+    // Ignore errors during shutdown
+  }
+  // Close all remaining preview windows
+  try {
+    closeAllPreviewWindows();
+  } catch (e) {
+    // Ignore errors during shutdown
+  }
+  app.quit();
+});
+
+// Maps target (from window.open) to BrowserWindow ID for child windows.
+// This is used to target the correct BrowserWindow for IPC messages.
+const windowTargetIdToBrowserWindowIds = new Map();
+
+// Function to create a new GDevelop window
+function createNewWindow(windowArgs = args) {
+  const isIntegrated = windowArgs.mode === 'integrated';
+  // windowArgs: a GUI primary process can still open a CLI window (second-instance fallback).
+  const isCliWindow = !!windowArgs['run-command'];
+
+  if (isIntegrated && app.dock) {
+    app.dock.hide();
+  }
+
+  // Create the browser window.
+  const options = {
+    width: windowArgs.width || 800,
+    height: windowArgs.height || 600,
+    x: windowArgs.x,
+    y: windowArgs.y,
+    titleBarStyle: 'hidden',
+    titleBarOverlay: {
+      color: '#000000',
+      symbolColor: '#ffffff',
+    },
+    trafficLightPosition: { x: 12, y: 12 },
+    webPreferences: {
+      webSecurity: false, // Allow to access to local files,
+      // Allow Node.js API access in renderer process, as long
+      // as we've not removed dependency on it and on "@electron/remote".
+      nodeIntegration: true,
+      contextIsolation: false,
+      // Keep timers and `requestAnimationFrame` running at full speed when
+      // the window is minimized or covered by another window (Chromium
+      // otherwise throttles timers to once a minute and stops animation
+      // frames entirely). The editor keeps working in the background: the
+      // AI agent keeps running its turns, and gameplay tests - which need
+      // animation frames to step the game - keep progressing.
+      backgroundThrottling: false,
+    },
+    enableLargerThanScreen: true,
+    backgroundColor: '#000',
+  };
+
+  // First window (windowCounter === 0) uses default storage for backwards compatibility
+  // Additional windows get unique partitions for independent auth AND separate renderer processes
+  const windowNumber = windowCounter;
+  if (windowCounter > 0) {
+    // Create a unique partition for this window so it has independent auth state
+    // Each partition gets its own storage (IndexedDB, localStorage, cookies, etc.)
+    options.webPreferences.partition = `persist:gdevelop-window-${windowCounter}`;
+    log.info(
+      `Creating window #${windowCounter} with partition: persist:gdevelop-window-${windowCounter}`
+    );
+  } else {
+    log.info(
+      `Creating window #${windowCounter} with default partition (backwards compatibility)`
+    );
+  }
+  windowCounter++;
+
+  if (isIntegrated) {
+    options.acceptFirstMouse = true;
+    options.skipTaskbar = true;
+    options.hasShadow = false;
+    options.frame = false;
+    options.minimizable = false;
+    options.movable = false;
+    options.resizable = false;
+    options.fullscreenable = false;
+    options.show = false;
+  }
+
+  // `--show`: watch an agent working on the project through the MCP server.
+  if (isCliWindow && !windowArgs['keep-open'] && !windowArgs['show']) {
+    options.show = false;
+    options.skipTaskbar = true;
+  }
+
+  const newWindow = new BrowserWindow(options);
+  if (!isIntegrated && !isCliWindow) newWindow.maximize();
+
+  // Capture window ID and whether this is the primary window before it can be destroyed
+  const windowId = newWindow.id;
+  const isPrimaryWindow = windowNumber === 0;
+  log.info(
+    `Created window with Electron ID: ${windowId}, window number: ${windowNumber}, isPrimary: ${isPrimaryWindow}`
+  );
+
+  // Track this window
+  mainWindows.add(newWindow);
+
+  // Set as primary window if this is the first one
+  if (isPrimaryWindow) {
+    mainWindow = newWindow;
+  }
+
+  // Enable `@electron/remote` module for renderer process
+  require('@electron/remote/main').enable(newWindow.webContents);
+
+  // Uses process.stdout/stderr directly (not electron-log) to avoid
+  // re-entering the renderer console and causing an infinite loop.
+  if (isCliWindow) {
+    newWindow.webContents.on('console-message', (_event, level, message) => {
+      if (level < 1) return;
+      if (message.startsWith('%c')) return;
+      if (message.includes('[renderer:')) return; // break recursion
+      const tag = ['verbose', 'info', 'warning', 'error'][level] || 'log';
+      // With --json, stdout only holds the result of the command.
+      const stream =
+        level >= 2 || windowArgs['json'] || windowArgs['mcp']
+          ? process.stderr
+          : process.stdout;
+      stream.write(`[renderer:${tag}] ${message}\n`);
+    });
+  }
+
+  // Log process ID to verify separate renderer processes
+  newWindow.webContents.once('did-finish-load', () => {
+    newWindow.webContents
+      .executeJavaScript('process.pid')
+      .then(pid => {
+        log.info(
+          `Window ${windowId} (window number ${windowNumber}) is running in renderer process PID: ${pid}`
+        );
+      })
+      .catch(err => {
+        log.warn('Could not get renderer process PID:', err);
+      });
+  });
+
+  if (isDev)
+    newWindow.webContents.session.loadExtension(
+      path.join(__dirname, 'extensions/ReactDeveloperTools/4.24.3_0/')
+    );
+
+  // Load the index.html of the app.
+  load({
+    window: newWindow,
+    isDev,
+    path: '/index.html',
+    devTools,
+  });
+
+  newWindow.on('closed', function() {
+    // Remove from tracked windows
+    mainWindows.delete(newWindow);
+    clearWindowFileIdentifier(windowId);
+    if (lastFocusedMainWindow === newWindow) lastFocusedMainWindow = null;
+    if (liveMcpServer) liveMcpServer.onWindowClosed(windowId);
+
+    // If this was the primary window, set a new primary
+    if (isPrimaryWindow) {
+      mainWindow = mainWindows.values().next().value || null;
+    }
+
+    // Close preview windows belonging to this window
+    closePreviewWindowsForParent(windowId);
+
+    // Stop the server and debugger for this window
+    stopServer(windowId, () => {});
+    closeDebuggerServer(windowId);
+  });
+
+  // Prevent any navigation inside the window
+  newWindow.webContents.on('will-navigate', (e, url) => {
+    if (url !== newWindow.webContents.getURL()) {
+      console.info('Opening in browser (because of will-navigate):', url);
+      e.preventDefault();
+      electron.shell.openExternal(url);
+    }
+  });
+
+  // Allow blank-URL pop-out windows (used by WindowPortal for editor pop-outs),
+  // but open all other URLs in the external browser.
+  newWindow.webContents.setWindowOpenHandler(details => {
+    if (details.frameName.startsWith('GDevelopWindowPortal')) {
+      // Extract the theme background color passed via the features string
+      // by WindowPortal (e.g. "...,themeBackgroundColor=%23282828").
+      let backgroundColor = '#000';
+      const match = details.features.match(/themeBackgroundColor=([^,]*)/);
+      if (match) {
+        try {
+          backgroundColor = decodeURIComponent(match[1]);
+        } catch (e) {}
+      }
+
+      return {
+        action: 'allow',
+        overrideBrowserWindowOptions: {
+          // Use hidden title bar with overlay controls, like the main window,
+          // so that ToolbarTitlebar can provide safe margins for window controls.
+          titleBarStyle: 'hidden',
+          titleBarOverlay: {
+            color: '#000000',
+            symbolColor: '#ffffff',
+          },
+          trafficLightPosition: { x: 12, y: 12 },
+          backgroundColor,
+          webPreferences: {
+            // No need for Node.js integration or disabled context isolation, because
+            // popped-out windows are driven by React portals and don't do any Node operations.
+            // Still keep webSecurity enabled to allow local file access.
+            // nodeIntegration: true,
+            // contextIsolation: false,
+            webSecurity: false,
+          },
+        },
+      };
+    }
+
+    console.info('Opening in browser (because of new window): ', details.url);
+    electron.shell.openExternal(details.url);
+    return { action: 'deny' };
+  });
+
+  // When a child window is created (e.g. a popped-out editor), set up security
+  // policies and enable @electron/remote on it.
+  newWindow.webContents.on('did-create-window', (childWindow, details) => {
+    require('@electron/remote/main').enable(childWindow.webContents);
+
+    if (
+      !details.frameName ||
+      !details.frameName.startsWith('GDevelopWindowPortal')
+    ) {
+      console.warn(
+        `Unexpected frameName for child window: ${
+          details.frameName
+        } - verify handling on Electron side.`
+      );
+    }
+
+    // Track child window by frameName so the renderer can look up its
+    // BrowserWindow ID (needed for titlebar overlay IPC targeting).
+    if (details.frameName) {
+      windowTargetIdToBrowserWindowIds.set(details.frameName, childWindow.id);
+      childWindow.on('closed', () => {
+        windowTargetIdToBrowserWindowIds.delete(details.frameName);
+      });
+    }
+
+    // Remove the menu bar from popped-out editor windows.
+    childWindow.setMenu(null);
+
+    // Prevent navigation inside child windows.
+    childWindow.webContents.on('will-navigate', (e, url) => {
+      if (url !== childWindow.webContents.getURL()) {
+        e.preventDefault();
+        electron.shell.openExternal(url);
+      }
+    });
+
+    // Block further nesting of new windows from pop-outs.
+    childWindow.webContents.setWindowOpenHandler(childDetails => {
+      electron.shell.openExternal(childDetails.url);
+      return { action: 'deny' };
+    });
+  });
+
+  return newWindow;
+}
+
+const setupLiveMcpServer = () => {
+  const settingsStore = makeLiveMcpServerSettingsStore(app.getPath('userData'));
+  let lastError = null;
+  liveMcpServer = createLiveMcpServer({
+    getTargetWindow: () =>
+      lastFocusedMainWindow && !lastFocusedMainWindow.isDestroyed()
+        ? lastFocusedMainWindow
+        : mainWindow,
+    log,
+  });
+
+  app.on('browser-window-focus', (_event, window) => {
+    if (mainWindows.has(window)) lastFocusedMainWindow = window;
+  });
+
+  const getStatus = () => {
+    const settings = settingsStore.read();
+    const port = liveMcpServer.getPort();
+    return {
+      enabled: settings.enabled,
+      port,
+      url: port ? `http://127.0.0.1:${port}/mcp` : null,
+      token: settings.token,
+      error: lastError,
+    };
+  };
+
+  const applySettings = async () => {
+    const settings = settingsStore.read();
+    lastError = null;
+    if (!settings.enabled) {
+      await liveMcpServer.stop();
+      return;
+    }
+    try {
+      await liveMcpServer.start({ port: settings.port, token: settings.token });
+    } catch (error) {
+      lastError = error.message;
+      log.error('[MCP] Could not start the live editor server:', error);
+    }
+  };
+
+  ipcMain.on('mcp-live-send', (_event, payload) =>
+    liveMcpServer.onWindowResponse(payload)
+  );
+  ipcMain.handle('mcp-live-server-get-status', () => getStatus());
+  ipcMain.handle('mcp-live-server-set-enabled', async (_event, enabled) => {
+    settingsStore.write({ ...settingsStore.read(), enabled: !!enabled });
+    await applySettings();
+    return getStatus();
+  });
+  ipcMain.handle('mcp-live-server-reset-token', async () => {
+    settingsStore.write({ ...settingsStore.read(), token: null });
+    await applySettings();
+    return getStatus();
+  });
+
+  applySettings();
+};
+
+// This method will be called when Electron has finished
+// initialization and is ready to create browser windows.
+app.on('ready', async function() {
+  // Handoff calls app.quit() but 'ready' still runs; without the lock, do not create a window.
+  if (!gotTheLock) {
+    return;
+  }
+
+  // A CLI/MCP instance started while the previous one exits would run logged
+  // out (see CliInstanceLock.js): wait for it.
+  if (isCliRunCommand) {
+    await waitForPreviousCliInstance({ app, log, timeoutMs: 10000 });
+  }
+
+  registerGdideProtocol({ isDev });
+
+  // Create the first window
+  createNewWindow(args);
+
+  // Expose program arguments (to be accessed by windows)
+  global['args'] = args;
+
+  Menu.setApplicationMenu(buildPlaceholderMainMenu());
+
+  // Set up dock menu (macOS) for creating new windows
+  if (app.dock) {
+    const dockMenu = Menu.buildFromTemplate([
+      {
+        label: 'New window',
+        click: () => {
+          createNewWindow(args);
+        },
+      },
+    ]);
+    app.dock.setMenu(dockMenu);
+  }
+
+  // Set up jump list tasks (Windows) for creating new windows
+  if (process.platform === 'win32') {
+    app.setUserTasks([
+      {
+        program: process.execPath,
+        arguments: '',
+        iconPath: process.execPath,
+        iconIndex: 0,
+        title: 'New window',
+        description: 'Open a new GDevelop window',
+      },
+    ]);
+  }
+
+  ipcMain.on('app-exit', (_event, exitCode) => {
+    // app.exit() skips 'before-quit': run the BYOK cleanup hooks explicitly
+    // or the managed Qdrant child is orphaned (audit011026 B-ELEC-8).
+    stopByokQdrantForExit();
+    app.exit(typeof exitCode === 'number' ? exitCode : 0);
+  });
+
+  if (args['mcp']) setupMcpStdioPipe({ ipcMain, app });
+
+  // The result of a CLI command (with --json): resolved once written, so the
+  // app does not exit before stdout is flushed.
+  ipcMain.handle(
+    'cli-write-stdout',
+    (_event, text) =>
+      new Promise(resolve =>
+        process.stdout.write(String(text), () => resolve())
+      )
+  );
+
+  // The input of a CLI command given as "-" (e.g. calls piped to GDevelop).
+  let cliStdinPromise = null;
+  ipcMain.handle('cli-read-stdin', () => {
+    if (!cliStdinPromise) {
+      cliStdinPromise = new Promise((resolve, reject) => {
+        const chunks = [];
+        process.stdin.on('data', chunk => chunks.push(chunk));
+        process.stdin.on('end', () =>
+          resolve(Buffer.concat(chunks).toString('utf8'))
+        );
+        process.stdin.on('error', reject);
+      });
+    }
+    return cliStdinPromise;
+  });
+
+  ipcMain.on('set-window-project-path', (event, fileIdentifier) => {
+    const window = BrowserWindow.fromWebContents(event.sender);
+    if (window) setWindowFileIdentifier(window.id, fileIdentifier);
+  });
+
+  // Not in a CLI process (like `--mcp`): it has no editor the user works in.
+  if (!isCliRunCommand) setupLiveMcpServer();
+
+  ipcMain.handle('install-cli-in-path', async () => {
+    // Inside an AppImage, process.execPath points into a transient mount that
+    // vanishes on quit; APPIMAGE is the stable file path (still breaks if moved).
+    return installCliInPath(process.env.APPIMAGE || process.execPath);
+  });
+
+  // BYOK API key encryption: the renderer delegates to safeStorage (the
+  // OS key store — DPAPI on Windows), see ByokSafeStorage.js.
+  ipcMain.handle('byok-encryption-available', () =>
+    isByokEncryptionAvailable()
+  );
+  ipcMain.handle('byok-encrypt', (_event, plainText) =>
+    encryptByokSecret(String(plainText))
+  );
+  ipcMain.handle('byok-decrypt', (_event, cipherText) =>
+    decryptByokSecret(String(cipherText))
+  );
+
+  // BYOK user skills: the .md files the user dropped in
+  // `<userData>/byok-skills`, read here and parsed/validated by the
+  // renderer (ByokSkills.js).
+  ipcMain.handle('byok-read-user-skills', () =>
+    readByokUserSkills(app.getPath('userData'))
+  );
+
+  // BYOK durable chat history (Phase 9.3): the Markdown chat files (and
+  // their image sidecars) under <userData>/byok-chats. The renderer owns
+  // the format and the validation (ByokChatPersistence.js) — this side
+  // only moves bytes.
+  registerByokChatFileHandlers(ipcMain, app);
+
+  // BYOK MCP server (Phase 10): the loopback HTTP endpoint external MCP
+  // clients reach through the stdio adapter. The renderer owns the tools —
+  // this side only validates, forwards and keeps the discovery file.
+  registerByokMcpServer(ipcMain, app);
+  registerByokRagFileHandlers(ipcMain, app);
+  registerByokQdrant(ipcMain, app);
+  // The confined BYOK resource downloads (import_project_resources):
+  // http(s) only, the cloud cookie only for gdevelop.io hosts, byte cap +
+  // timeout, target confined to the project folder.
+  registerByokResourceDownload(ipcMain);
+  // The BYOK game-code files (Phase 15.1): the renderer owns the folder
+  // name, the load order and the rules; this side only moves bytes, and
+  // re-checks every path against the folder it derives from the project
+  // file.
+  registerByokGameCodeFiles(ipcMain);
+  // Phase 16.2: the build-time asset optimizer — the renderer owns the policy
+  // (Fork/AssetBuild/ForkAssetPlan.js) and the plan; this side only applies it
+  // in place (ForkAssetOptimizer.js) and reports before/after bytes.
+  registerForkAssetOptimizer(ipcMain);
+  // Phase 19.2: crop a sprite sheet atlas into frame PNGs inside the
+  // project's assets folder (ForkSpriteSheet.js) — the renderer owns the
+  // plan (Fork/SpriteSheet/ForkSpriteSheetPlan.js) and the naming.
+  registerForkSpriteSheetSlicer(ipcMain);
+  // Phase 17.2: the optional <project>/assets-index.json sidecar — the
+  // renderer owns the format and the "metadata is the authority" rule; this
+  // side only reads/writes the one confined file.
+  registerForkAssetIndexFiles(ipcMain);
+  // The managed Qdrant (BYOK RAG) starts with the app once installed.
+  // Called directly (not via app.on('ready')): this code already runs
+  // inside the one 'ready' emission, and a listener registered during an
+  // emission is never called (audit011026 B-ELEC-3 — the autostart used to
+  // silently never run).
+  ensureByokQdrantStarted(app);
+
+  // BYOK perception: capture a screenshot of an open preview window (the
+  // last one when no id is given) as base64 PNG — works while the window is
+  // occluded. The renderer side lives in ByokRuntimeTools.
+  ipcMain.handle('byok-preview-capture', (_event, previewId) => {
+    const openPreviews = getPreviewWindows()
+      .map(entry => entry.previewWindow)
+      .filter(window => window && !window.isDestroyed());
+    const previewWindow =
+      (typeof previewId === 'number'
+        ? openPreviews.find(window => window.id === previewId)
+        : null) ||
+      openPreviews[openPreviews.length - 1] ||
+      null;
+    if (!previewWindow) {
+      return Promise.resolve({
+        ok: false,
+        error: 'No preview window is open.',
+      });
+    }
+    return previewWindow.webContents
+      .capturePage()
+      .then(image => ({ ok: true, data: image.toPNG().toString('base64') }))
+      .catch(error => ({
+        ok: false,
+        error: (error && error.message) || String(error),
+      }));
+  });
+
+  ipcMain.on('set-main-menu', (event, mainMenuTemplate) => {
+    const window = BrowserWindow.fromWebContents(event.sender);
+    Menu.setApplicationMenu(
+      buildElectronMenuFromDeclarativeTemplate(
+        window || mainWindow,
+        mainMenuTemplate
+      )
+    );
+  });
+
+  ipcMain.handle('preview-open', async (event, options) => {
+    const parentWindow = BrowserWindow.fromWebContents(event.sender);
+    return openPreviewWindow({
+      parentWindow: parentWindow,
+      previewBrowserWindowOptions: options.previewBrowserWindowOptions,
+      previewGameIndexHtmlPath: options.previewGameIndexHtmlPath,
+      alwaysOnTop: options.alwaysOnTop,
+      hideMenuBar: options.hideMenuBar,
+      numberOfWindows: options.numberOfWindows,
+      captureOptions: options.captureOptions,
+      openEvent: event,
+    });
+  });
+  ipcMain.handle('preview-close', async (event, options) => {
+    return closePreviewWindow(options.windowId);
+  });
+
+  ipcMain.handle('preview-close-all', async () => {
+    return closeAllPreviewWindows();
+  });
+
+  // Piskel image editor
+  ipcMain.handle('piskel-load', (event, externalEditorInput) => {
+    const parentWindow = BrowserWindow.fromWebContents(event.sender);
+    return loadExternalEditorWindow({
+      parentWindow: parentWindow,
+      devTools,
+      indexSubPath: 'piskel/piskel-electron-index.html',
+      externalEditorInput,
+    });
+  });
+
+  // JFXR sound effect generator
+  ipcMain.handle('jfxr-load', (event, externalEditorInput) => {
+    const parentWindow = BrowserWindow.fromWebContents(event.sender);
+    return loadExternalEditorWindow({
+      parentWindow: parentWindow,
+      devTools,
+      indexSubPath: 'jfxr/jfxr-electron-index.html',
+      externalEditorInput,
+    });
+  });
+
+  // Yarn Dialogue Tree Editor
+  ipcMain.handle('yarn-load', (event, externalEditorInput) => {
+    const parentWindow = BrowserWindow.fromWebContents(event.sender);
+    return loadExternalEditorWindow({
+      parentWindow: parentWindow,
+      devTools,
+      indexSubPath: 'yarn/yarn-electron-index.html',
+      externalEditorInput,
+    });
+  });
+
+  // LocalFileUploader events:
+  ipcMain.on('local-file-upload', (event, localFilePath, uploadOptions) => {
+    log.info(
+      'Received event local-file-upload with localFilePath=',
+      localFilePath
+    );
+
+    uploadLocalFile(
+      localFilePath,
+      uploadOptions,
+      throttle((current, max) => {
+        event.sender.send('local-file-upload-progress', current, max);
+      }, 300)
+    ).then(
+      () => {
+        log.info('Local file upload successfully done');
+        event.sender.send('local-file-upload-done', null);
+      },
+      uploadError => {
+        log.error('Local file upload errored', uploadError);
+        event.sender.send('local-file-upload-done', uploadError);
+      }
+    );
+  });
+
+  // Titlebar handling:
+  ipcMain.handle(
+    'titlebar-set-overlay-options',
+    async (event, overlayOptions, optionalTargetId) => {
+      // When a optionalTargetId is provided, resolve it to the child BrowserWindow
+      // (needed for popped-out editor windows, where event.sender is always
+      // the main window's webContents). Otherwise, use event.sender.
+      let window;
+      if (optionalTargetId) {
+        const windowId = windowTargetIdToBrowserWindowIds.get(optionalTargetId);
+        window = windowId != null ? BrowserWindow.fromId(windowId) : null;
+      } else {
+        window = BrowserWindow.fromWebContents(event.sender);
+      }
+      if (!window) return;
+
+      // setTitleBarOverlay seems not defined on macOS.
+      if (window.setTitleBarOverlay) window.setTitleBarOverlay(overlayOptions);
+      if (window.setBackgroundColor)
+        window.setBackgroundColor(overlayOptions.color);
+    }
+  );
+
+  // Window maximize toggle (for double-click on titlebar):
+  ipcMain.handle('window-maximize-toggle', async event => {
+    const window = BrowserWindow.fromWebContents(event.sender);
+    if (!window) return;
+
+    if (window.isMaximized()) {
+      window.unmaximize();
+    } else {
+      window.maximize();
+    }
+  });
+
+  // LocalFileDownloader events:
+  ipcMain.handle(
+    'local-file-download',
+    async (event, url, outputPath, basePath) => {
+      const result = await downloadLocalFile(url, outputPath, basePath);
+      return result;
+    }
+  );
+  ipcMain.handle(
+    'local-file-save-from-arraybuffer',
+    async (event, arrayBuffer, outputPath, basePath) => {
+      const result = await saveLocalFileFromArrayBuffer(
+        arrayBuffer,
+        outputPath,
+        basePath
+      );
+      return result;
+    }
+  );
+
+  // LocalFilesystemWatcher events:
+  ipcMain.handle(
+    'local-filesystem-watcher-setup',
+    (event, folderPath, options) => {
+      const subscriptionId = setupWatcher(
+        folderPath,
+        // Fork (Phase 17 [P17-kind-hint]): the second argument is the
+        // chokidar event type ('add' | 'change' | 'unlink').
+        (changedFilePath, changedEventKind) => {
+          if (!event.sender.isDestroyed()) {
+            event.sender.send(
+              'project-file-changed',
+              changedFilePath,
+              changedEventKind
+            );
+          }
+        },
+        options
+      );
+      return subscriptionId;
+    }
+  );
+  ipcMain.handle(
+    'local-filesystem-watcher-disable',
+    (event, subscriptionId) => {
+      disableWatcher(subscriptionId);
+    }
+  );
+
+  // ServeFolder events:
+  ipcMain.on('serve-folder', (event, options) => {
+    const window = BrowserWindow.fromWebContents(event.sender);
+    const windowId = window ? window.id : 'unknown';
+    log.info(
+      'Received event to server folder with options=',
+      options,
+      'for window',
+      windowId
+    );
+
+    serveFolder({ ...options, windowId }, (err, serverParams) => {
+      // Using JSON to copy the config strips unserializable properties
+      // (like middleware functions) automatically.
+      const configCopy = JSON.parse(JSON.stringify(serverParams));
+      event.sender.send('serve-folder-done', err, configCopy);
+    });
+  });
+
+  ipcMain.on('stop-server', event => {
+    const window = BrowserWindow.fromWebContents(event.sender);
+    const windowId = window ? window.id : 'unknown';
+    log.info('Received event to stop server for window', windowId);
+
+    stopServer(windowId, err => {
+      event.sender.send('stop-server-done', err);
+    });
+  });
+
+  ipcMain.on('get-local-network-ip', event => {
+    event.sender.send('local-network-ip', findLocalIp());
+  });
+
+  // LocalGDJSDevelopmentWatcher events:
+  ipcMain.on('setup-local-gdjs-development-watcher', event => {
+    setupLocalGDJSDevelopmentWatcher();
+  });
+
+  ipcMain.on('close-local-gdjs-development-watcher', event => {
+    closeLocalGDJSDevelopmentWatcher();
+  });
+
+  onLocalGDJSDevelopmentWatcherRuntimeUpdated(() => {
+    log.info(
+      'Notifying all editor windows that the GDJS runtime has been updated.'
+    );
+    mainWindows.forEach(window => {
+      window.webContents.send(
+        'local-gdjs-development-watcher-runtime-updated',
+        null
+      );
+    });
+  });
+
+  // DebuggerServer events:
+  ipcMain.on('debugger-start-server', (event, options) => {
+    const window = BrowserWindow.fromWebContents(event.sender);
+    const windowId = window ? window.id : 'unknown';
+    log.info(
+      'Received event to start debugger server with options=',
+      options,
+      'for window',
+      windowId
+    );
+
+    startDebuggerServer(windowId, {
+      onMessage: ({ id, message }) => {
+        if (!event.sender.isDestroyed()) {
+          event.sender.send('debugger-message-received', { id, message });
+        }
+      },
+      onError: error => {
+        if (!event.sender.isDestroyed()) {
+          event.sender.send('debugger-error-received', error);
+        }
+      },
+      onConnectionClose: ({ id }) => {
+        if (!event.sender.isDestroyed()) {
+          event.sender.send('debugger-connection-closed', { id });
+        }
+      },
+      onConnectionOpen: ({ id }) => {
+        if (!event.sender.isDestroyed()) {
+          event.sender.send('debugger-connection-opened', { id });
+        }
+      },
+      onConnectionError: ({ id, errorMessage }) => {
+        if (!event.sender.isDestroyed()) {
+          event.sender.send('debugger-connection-errored', {
+            id,
+            errorMessage,
+          });
+        }
+      },
+      onListening: ({ address }) => {
+        if (!event.sender.isDestroyed()) {
+          event.sender.send('debugger-start-server-done', { address });
+        }
+      },
+    });
+  });
+
+  ipcMain.on('debugger-send-message', (event, message) => {
+    const window = BrowserWindow.fromWebContents(event.sender);
+    const windowId = window ? window.id : 'unknown';
+    sendMessage(windowId, message, err => {
+      if (!event.sender.isDestroyed()) {
+        event.sender.send('debugger-send-message-done', err);
+      }
+    });
+  });
+
+  ipcMain.on('debugger-close-all-connections', event => {
+    const window = BrowserWindow.fromWebContents(event.sender);
+    const windowId = window ? window.id : 'unknown';
+    closeAllConnections(windowId);
+  });
+
+  // Track whether the current update check was triggered explicitly by the user,
+  // so that errors are only surfaced to the user for manual checks.
+  let isExplicitUpdateCheck = false;
+
+  ipcMain.on('updates-check-and-download', (event, { explicit } = {}) => {
+    // This will immediately download an update, then install when the
+    // app quits.
+    isExplicitUpdateCheck = !!explicit;
+    log.info('Starting check for updates (with auto-download if any)');
+    autoUpdater.autoDownload = true;
+    autoUpdater.checkForUpdatesAndNotify().catch(err => {
+      log.error('Error checking for updates:', err);
+    });
+  });
+
+  ipcMain.on('updates-check', (event, { explicit } = {}) => {
+    isExplicitUpdateCheck = !!explicit;
+    log.info('Starting check for updates (without auto-download)');
+    autoUpdater.autoDownload = false;
+    autoUpdater.checkForUpdates().catch(err => {
+      log.error('Error checking for updates:', err);
+    });
+  });
+
+  ipcMain.on('updates-install-and-quit', () => {
+    autoUpdater.quitAndInstall();
+  });
+
+  function sendUpdateStatus(status) {
+    log.info(status);
+    mainWindows.forEach(window => {
+      if (!window.isDestroyed()) {
+        window.webContents.send('update-status', status);
+      }
+    });
+  }
+  autoUpdater.on('checking-for-update', () => {
+    sendUpdateStatus({
+      message: 'Checking for update...',
+      status: 'checking-for-update',
+    });
+  });
+  autoUpdater.on('update-available', info => {
+    sendUpdateStatus({
+      message: 'Update available.',
+      status: 'update-available',
+      info,
+    });
+  });
+  autoUpdater.on('update-not-available', info => {
+    sendUpdateStatus({
+      message: 'Update not available.',
+      status: 'update-not-available',
+    });
+  });
+  autoUpdater.on('error', err => {
+    if (isExplicitUpdateCheck) {
+      sendUpdateStatus({
+        message: 'Error in auto-updater. ' + err,
+        status: 'error',
+        err,
+      });
+    } else {
+      log.error('Background update check failed:', err);
+    }
+  });
+  autoUpdater.on('download-progress', progressObj => {
+    let logMessage = 'Download speed: ' + progressObj.bytesPerSecond;
+    logMessage = logMessage + ' - Downloaded ' + progressObj.percent + '%';
+    logMessage =
+      logMessage +
+      ' (' +
+      progressObj.transferred +
+      '/' +
+      progressObj.total +
+      ')';
+    sendUpdateStatus({
+      message: logMessage,
+      status: 'download-progress',
+      bytesPerSecond: progressObj.bytesPerSecond,
+      percent: progressObj.percent,
+      transferred: progressObj.transferred,
+      total: progressObj.total,
+    });
+  });
+  autoUpdater.on('update-downloaded', info => {
+    sendUpdateStatus({
+      message: 'Update downloaded',
+      status: 'update-downloaded',
+      info,
+    });
+  });
+
+  setUpDiscordRichPresence(ipcMain);
+
+  const NPM_SCRIPT_COMMAND_FAILED_MESSAGE = 'Command failed!';
+
+  // npm script execution in external terminal (cross-platform)
+  ipcMain.on(
+    'run-npm-script',
+    (event, { projectPath, npmScript, keepTerminalOpen }) => {
+      log.info(`Running npm script "${npmScript}" in ${projectPath}`);
+
+      const platform = process.platform;
+      const npmCommand = `npm run ${npmScript}`;
+      const keepOpen = !!keepTerminalOpen;
+
+      try {
+        if (platform === 'win32') {
+          const innerCmd = keepOpen
+            ? `cd /d ${projectPath} && ${npmCommand}`
+            : `cd /d ${projectPath} && ${npmCommand} || (echo. & echo ${NPM_SCRIPT_COMMAND_FAILED_MESSAGE} & pause)`;
+          const cmdCloseFlag = keepOpen ? '/k' : '/c';
+          child_process
+            .spawn(
+              'cmd.exe',
+              ['/c', 'start', 'cmd.exe', cmdCloseFlag, innerCmd],
+              {
+                detached: true,
+                stdio: 'ignore',
+              }
+            )
+            .unref();
+        } else if (platform === 'darwin') {
+          const escapedPath = projectPath.replace(/'/g, "'\\''");
+          const shellCommand = keepOpen
+            ? `cd '${escapedPath}' && ${npmCommand}`
+            : `cd '${escapedPath}' && ${npmCommand} && exit || echo '${NPM_SCRIPT_COMMAND_FAILED_MESSAGE}'`;
+          const script = `tell application "Terminal" to do script "${shellCommand.replace(
+            /"/g,
+            '\\"'
+          )}"`;
+          child_process.spawn('osascript', ['-e', script], {
+            detached: true,
+            stdio: 'ignore',
+          });
+        } else {
+          const bashCommand = keepOpen
+            ? `cd "${projectPath}" && ${npmCommand}; exec bash`
+            : `cd "${projectPath}" && ${npmCommand} || { echo "${NPM_SCRIPT_COMMAND_FAILED_MESSAGE}"; exec bash; }`;
+          const terminals = [
+            {
+              cmd: 'x-terminal-emulator',
+              args: ['-e', 'bash', '-c', bashCommand],
+            },
+            { cmd: 'gnome-terminal', args: ['--', 'bash', '-c', bashCommand] },
+            { cmd: 'konsole', args: ['-e', 'bash', '-c', bashCommand] },
+            { cmd: 'xterm', args: ['-e', 'bash', '-c', bashCommand] },
+          ];
+
+          const tryTerminal = index => {
+            if (index >= terminals.length) {
+              log.error('No terminal emulator found');
+              return;
+            }
+            const terminal = terminals[index];
+            const proc = child_process.spawn(terminal.cmd, terminal.args, {
+              detached: true,
+              stdio: 'ignore',
+            });
+            proc.on('error', () => tryTerminal(index + 1));
+            proc.unref();
+          };
+
+          tryTerminal(0);
+        }
+      } catch (err) {
+        log.error('Failed to run npm script:', err);
+      }
+    }
+  );
+});

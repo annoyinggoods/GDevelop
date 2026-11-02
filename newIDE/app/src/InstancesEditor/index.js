@@ -1,0 +1,2037 @@
+// @flow
+import React, { Component } from 'react';
+import debounce from 'lodash/debounce';
+import panable, { type PanMoveEvent } from '../Utils/PixiSimpleGesture/pan';
+import KeyboardShortcuts, { MID_MOUSE_BUTTON } from '../UI/KeyboardShortcuts';
+import isUserTyping from '../KeyboardShortcuts/IsUserTyping';
+import InstancesRenderer from './InstancesRenderer';
+import ViewPosition from './ViewPosition';
+import SelectedInstances from './SelectedInstances';
+import HighlightedInstance from './HighlightedInstance';
+import HiddenInstancesDecorations from './HiddenInstancesDecorations';
+import SelectionRectangle from './SelectionRectangle';
+import InstancesResizer, {
+  type ResizeGrabbingLocation,
+  canMoveOnX,
+  canMoveOnY,
+} from './InstancesResizer';
+import InstancesRotator from './InstancesRotator';
+import InstancesMover from './InstancesMover';
+import Grid from './Grid';
+import WindowBorder from './WindowBorder';
+import WindowMask from './WindowMask';
+import * as PIXI from 'pixi.js-legacy';
+import * as THREE from 'three';
+import FpsLimiter from './FpsLimiter';
+import { startPIXITicker, stopPIXITicker } from '../Utils/PIXITicker';
+import StatusBar from './StatusBar';
+import ProfilerBar from './ProfilerBar';
+import CanvasCursor from './CanvasCursor';
+import InstancesAdder from './InstancesAdder';
+import { makeDropTarget } from '../UI/DragAndDrop/DropTarget';
+import { objectWithContextReactDndType } from '../ObjectsList';
+import PinchHandler, { shouldBeHandledByPinch } from './PinchHandler';
+import { type ScreenType } from '../UI/Responsive/ScreenTypeMeasurer';
+import InstancesSelection from './InstancesSelection';
+import LongTouchHandler from './LongTouchHandler';
+import {
+  getRecommendedInitialZoomFactor,
+  type InstancesEditorSettings,
+} from './InstancesEditorSettings';
+import Rectangle from '../Utils/Rectangle';
+import { shouldPreventRenderingInstanceEditors } from '../UI/MaterialUISpecificUtil';
+import {
+  clampInstancesEditorZoom,
+  getWheelStepZoomFactor,
+} from '../Utils/ZoomUtils';
+import Background from './Background';
+import TileMapPaintingPreview, {
+  updateSceneToTileMapTransformation,
+} from './TileMapPaintingPreview';
+import {
+  getTileIdFromGridCoordinates,
+  getGridCoordinatesFromTileId,
+  createSelectionWithPreviousTool,
+  type TileMapTileSelection,
+  getTileMapPaintingSelection,
+} from './TileSetVisualizer';
+import ClickInterceptor from './ClickInterceptor';
+import getObjectByName from '../Utils/GetObjectByName';
+import { AffineTransformation } from '../Utils/AffineTransformation';
+import { ErrorFallbackComponent } from '../UI/ErrorBoundary';
+import { startNativeAppActivity } from '../Utils/NativeAppLifecycle';
+import { isWebGL2Supported } from '../Utils/WebGL';
+import { Trans } from '@lingui/macro';
+import { generateUUID } from 'three/src/math/MathUtils';
+import {
+  getTilesGridCoordinatesFromPointerSceneCoordinates,
+  getTileSet,
+  isTileSetBadlyConfigured,
+} from '../Utils/TileMap';
+
+const gd: libGDevelop = global.gd;
+
+export const instancesEditorId = 'instances-editor-canvas';
+const styles = {
+  canvasArea: { flex: 1, position: 'absolute', overflow: 'hidden' },
+  dropCursor: { cursor: 'copy' },
+};
+
+const DropTarget = makeDropTarget<{||}>(objectWithContextReactDndType);
+
+export type EditorViewPosition2D = {|
+  viewX: number | null,
+  viewY: number | null,
+|};
+
+export type InstancesEditorShortcutsCallbacks = {|
+  onDelete: () => void,
+  onCopy: () => void,
+  onCut: () => void,
+  onPaste: () => void,
+  onDuplicate: () => void,
+  onUndo: () => void,
+  onRedo: () => void,
+  onZoomOut: () => void,
+  onZoomIn: () => void,
+  onShift1: () => void,
+  onShift2: () => void,
+  onShift3: () => void,
+  onFocusOnSelection: () => void,
+|};
+
+export type InstancesEditorPropsWithoutSizeAndScroll = {|
+  project: gdProject,
+  layout: gdLayout | null,
+  eventsBasedObject: gdEventsBasedObject | null,
+  eventsBasedObjectVariant: gdEventsBasedObjectVariant | null,
+  layersContainer: gdLayersContainer,
+  globalObjectsContainer: gdObjectsContainer | null,
+  objectsContainer: gdObjectsContainer,
+  chosenLayer: string,
+  initialInstances: gdInitialInstancesContainer,
+  instancesEditorSettings: InstancesEditorSettings,
+  isInstanceOf3DObject: gdInitialInstance => boolean,
+  onInstancesEditorSettingsMutated: (
+    instancesEditorSettings: InstancesEditorSettings
+  ) => void,
+  instancesSelection: InstancesSelection,
+  onInstancesAdded: (instances: Array<gdInitialInstance>) => void,
+  onInstancesSelected: (instances: Array<gdInitialInstance>) => void,
+  onInstanceDoubleClicked: (instance: gdInitialInstance) => void,
+  onInstancesMoved: (instances: Array<gdInitialInstance>) => void,
+  onInstancesResized: (instances: Array<gdInitialInstance>) => void,
+  onInstancesRotated: (instances: Array<gdInitialInstance>) => void,
+  selectedObjectNames: Array<string>,
+  onContextMenu: (
+    x: number,
+    y: number,
+    ignoreSelectedObjectNamesForContextMenu?: boolean
+  ) => void,
+  pauseRendering: boolean,
+  instancesEditorShortcutsCallbacks: InstancesEditorShortcutsCallbacks,
+  tileMapTileSelection: ?TileMapTileSelection,
+  onSelectTileMapTile: (?TileMapTileSelection) => void,
+  editorViewPosition2D: EditorViewPosition2D,
+|};
+
+type Props = {|
+  ...InstancesEditorPropsWithoutSizeAndScroll,
+  width: number,
+  height: number,
+  onViewPositionChanged?: ViewPosition => void,
+  onMouseMove?: MouseEvent => void,
+  onMouseLeave?: MouseEvent => void,
+  screenType: ScreenType,
+  showObjectInstancesIn3D: boolean,
+  showBasicProfilingCounters: boolean,
+|};
+
+type State = {|
+  renderingError: null | {|
+    error: Error,
+    uniqueErrorId: string,
+  |},
+|};
+
+export default class InstancesEditor extends Component<Props, State> {
+  lastContextMenuX = 0;
+  lastContextMenuY = 0;
+  lastCursorX: number | null = null;
+  lastCursorY: number | null = null;
+  fpsLimiter: FpsLimiter = new FpsLimiter({ maxFps: 60, idleFps: 10 });
+  canvasArea: ?HTMLDivElement;
+  // $FlowFixMe[value-as-type]
+  pixiRenderer: PIXI.Renderer;
+  // $FlowFixMe[value-as-type]
+  threeRenderer: THREE.WebGLRenderer | null = null;
+  keyboardShortcuts: KeyboardShortcuts;
+  pinchHandler: PinchHandler;
+  canvasCursor: CanvasCursor;
+  _instancesAdder: InstancesAdder;
+  selectionRectangle: SelectionRectangle;
+  selectedInstances: SelectedInstances;
+  tileMapPaintingPreview: TileMapPaintingPreview;
+  clickInterceptor: ClickInterceptor;
+  highlightedInstance: HighlightedInstance;
+  hiddenInstancesDecorations: HiddenInstancesDecorations;
+  instancesResizer: InstancesResizer;
+  instancesRotator: InstancesRotator;
+  instancesMover: InstancesMover;
+  windowBorder: WindowBorder;
+  windowMask: WindowMask;
+  statusBar: StatusBar;
+  profilerBar: ProfilerBar;
+  // $FlowFixMe[value-as-type]
+  uiPixiContainer: PIXI.Container;
+  // $FlowFixMe[value-as-type]
+  backgroundPixiContainer: PIXI.Container;
+  // $FlowFixMe[value-as-type]
+  backgroundArea: PIXI.Container;
+  instancesRenderer: InstancesRenderer;
+  viewPosition: ViewPosition;
+  longTouchHandler: LongTouchHandler;
+  grid: Grid;
+  background: Background;
+  _unmounted = false;
+  _stopNativeAppActivity: (() => void) | null = null;
+  _renderingPausedReasons: Set<string> = new Set();
+  nextFrame: AnimationFrameID;
+  contextMenuLongTouchTimeoutID: TimeoutID;
+  hasCursorMovedSinceItIsDown = false;
+  _instanceUnderPointerDown: gdInitialInstance | null = null;
+  _isPointerOverCanvas = false;
+  _showObjectInstancesIn3D: boolean = false;
+  _previousToolBeforePicker: ?TileMapTileSelection = null;
+
+  state: State = {
+    renderingError: null,
+  };
+
+  componentDidMount() {
+    // Initialize the PIXI renderer, if possible
+    if (this.canvasArea && !this.pixiRenderer) {
+      this._initializeCanvasAndRenderer();
+    }
+  }
+
+  componentDidUpdate(prevProps: Props) {
+    // Initialize the PIXI renderer, if not already done.
+    // This can happen if canvasArea was not rendered
+    // just after the mount (depends on react-dnd versions?).
+    if (this.canvasArea && !this.pixiRenderer) {
+      this._initializeCanvasAndRenderer();
+    }
+
+    // Track previous tool before picker is activated
+    const { tileMapTileSelection } = this.props;
+    const prevTileMapTileSelection = prevProps.tileMapTileSelection;
+
+    const isPickerActive =
+      tileMapTileSelection && tileMapTileSelection.kind === 'picker';
+    const wasPickerActive =
+      prevTileMapTileSelection && prevTileMapTileSelection.kind === 'picker';
+
+    if (isPickerActive && !wasPickerActive) {
+      // Picker just activated, store the previous tool
+      this._previousToolBeforePicker = prevTileMapTileSelection;
+    } else if (!isPickerActive && wasPickerActive) {
+      // Picker just deactivated, clear the stored previous tool
+      this._previousToolBeforePicker = null;
+    }
+  }
+
+  _initializeCanvasAndRenderer() {
+    const { canvasArea } = this;
+    if (!canvasArea) return;
+
+    // project can be used here for initializing stuff, but don't keep references to it.
+    // Instead, create editors in _mountEditorComponents (as they will be destroyed/recreated
+    // if the project changes).
+    const { onMouseMove, onMouseLeave } = this.props;
+
+    this.keyboardShortcuts = new KeyboardShortcuts({
+      isActive: this._shouldHandleKeyboardShortcuts,
+      shortcutCallbacks: {
+        onMove: this.moveSelection,
+        ...this.props.instancesEditorShortcutsCallbacks,
+      },
+    });
+
+    let gameCanvas: HTMLCanvasElement;
+    // Ensure we don't initialize with 0 dimensions, which is invalid for PixiJS/WebGL
+    // and can cause shader creation to fail on some platforms (e.g. Windows with ANGLE).
+    const initialWidth = this.props.width || 1;
+    const initialHeight = this.props.height || 1;
+    // Three.js requires WebGL2. The preference can still be enabled on devices
+    // without it (it was persisted before this requirement), so fall back to 2D.
+    let threeCanvas: HTMLCanvasElement | null = null;
+    // $FlowFixMe[value-as-type]
+    let threeRenderer: THREE.WebGLRenderer | null = null;
+    // TODO (3D): Should it handle preference changes without needing to reopen tabs?
+    if (this.props.showObjectInstancesIn3D && isWebGL2Supported()) {
+      try {
+        threeCanvas = document.createElement('canvas');
+        threeRenderer = new THREE.WebGLRenderer({
+          canvas: threeCanvas,
+          // Ask for the discrete graphics card, if any.
+          powerPreference: 'high-performance',
+        });
+      } catch (error) {
+        console.error(
+          'Unable to create the Three.js renderer, falling back to 2D rendering:',
+          error
+        );
+        threeCanvas = null;
+        threeRenderer = null;
+      }
+    }
+    this._showObjectInstancesIn3D = !!threeRenderer;
+    if (threeCanvas && threeRenderer) {
+      gameCanvas = threeCanvas;
+      threeRenderer.autoClear = false;
+      threeRenderer.setSize(initialWidth, initialHeight);
+
+      // Create a PixiJS renderer that use the same GL context as Three.js
+      // so that both can render to the canvas and even have PixiJS rendering
+      // reused in Three.js (by using a RenderTexture and the same internal WebGL texture).
+      this.pixiRenderer = new PIXI.Renderer({
+        width: initialWidth,
+        height: initialHeight,
+        view: gameCanvas,
+        context: threeRenderer.getContext(),
+        clearBeforeRender: false,
+        preserveDrawingBuffer: true,
+        antialias: false,
+        backgroundAlpha: 0,
+        // It's the default value, but it's better to make it explicit.
+        // It allows instances composed of several pixi objects to detect hovering.
+        eventMode: 'auto',
+        // TODO (3D): add a setting for pixel ratio (`resolution: window.devicePixelRatio`)
+      });
+
+      this.threeRenderer = threeRenderer;
+    } else {
+      // Create the renderer and setup the rendering area for scene editor.
+      this.pixiRenderer = PIXI.autoDetectRenderer({
+        width: initialWidth,
+        height: initialHeight,
+        // "preserveDrawingBuffer: true" is needed to avoid flickering and background issues on some mobile phones (see #585 #572 #566 #463)
+        preserveDrawingBuffer: true,
+        // Disable anti-aliasing (default) to avoid rendering issue (1px width line of extra pixels) when rendering pixel perfect tiled sprites.
+        antialias: false,
+        clearBeforeRender: false,
+        backgroundAlpha: 0,
+      });
+
+      gameCanvas = this.pixiRenderer.view;
+    }
+
+    // Each instances editor keeps a WebGL context and its textures alive.
+    if (this._stopNativeAppActivity) this._stopNativeAppActivity();
+    this._stopNativeAppActivity = startNativeAppActivity('instances-editor');
+
+    // Deactivating accessibility support in PixiJS renderer, as we want to be in control of this.
+    // See https://github.com/pixijs/pixijs/issues/5111#issuecomment-420047824
+    this.pixiRenderer.plugins.accessibility.destroy();
+    delete this.pixiRenderer.plugins.accessibility;
+
+    // Add the renderer view element to the DOM
+    canvasArea.appendChild(gameCanvas);
+    this.statusBar = new StatusBar({
+      container: canvasArea,
+      getLastCursorSceneCoordinates: this.getLastCursorSceneCoordinates,
+      isPointerOverCanvas: () => this._isPointerOverCanvas,
+    });
+
+    this.pixiRenderer.view.style.outline = 'none';
+
+    this.longTouchHandler = new LongTouchHandler({
+      canvas: this.pixiRenderer.view,
+      onLongTouch: event =>
+        this.props.onContextMenu(event.clientX, event.clientY),
+    });
+
+    this.pixiRenderer.view.onwheel = (event: WheelEvent) => {
+      this.fpsLimiter.notifyInteractionHappened();
+      const zoomFactor = this.getZoomFactor();
+      if (this.keyboardShortcuts.shouldZoom(event)) {
+        this.zoomOnCursorBy(getWheelStepZoomFactor(-event.deltaY));
+      } else if (this.keyboardShortcuts.shouldScrollHorizontally()) {
+        const deltaX = event.deltaY / (5 * zoomFactor);
+        this.scrollBy(-deltaX, 0);
+      } else {
+        const deltaX = event.deltaX / (5 * zoomFactor);
+        const deltaY = event.deltaY / (5 * zoomFactor);
+        this.scrollBy(deltaX, deltaY);
+      }
+
+      event.preventDefault();
+    };
+    this.pixiRenderer.view.setAttribute('tabIndex', -1);
+    // Listened on the window (in the capture phase, as tree views stop the propagation)
+    // so that shortcuts also work when the canvas is only hovered, like the wheel zoom.
+    window.addEventListener('keydown', this.keyboardShortcuts.onKeyDown, true);
+    // Key releases are always handled, so that a key released outside the canvas or
+    // while the window is blurred is not considered as still pressed.
+    window.addEventListener('keyup', this.keyboardShortcuts.onKeyUp, true);
+    window.addEventListener('blur', this.keyboardShortcuts.resetModifiers);
+    this.pixiRenderer.view.addEventListener(
+      'mousedown',
+      this.keyboardShortcuts.onMouseDown
+    );
+    this.pixiRenderer.view.addEventListener(
+      'mouseup',
+      this.keyboardShortcuts.onMouseUp
+    );
+    this.pixiRenderer.view.addEventListener('mousemove', event => {
+      this._isPointerOverCanvas = true;
+      this._onMouseMove(event.offsetX, event.offsetY);
+      if (onMouseMove) onMouseMove(event);
+    });
+    this.pixiRenderer.view.addEventListener('mouseout', event => {
+      this._isPointerOverCanvas = false;
+      if (onMouseLeave) onMouseLeave(event);
+    });
+    this.pixiRenderer.view.addEventListener('focusout', event => {
+      if (this.keyboardShortcuts) {
+        this.keyboardShortcuts.resetModifiers();
+      }
+    });
+
+    this.uiPixiContainer = new PIXI.Container();
+    this.backgroundPixiContainer = new PIXI.Container();
+
+    this.backgroundArea = new PIXI.Container();
+    this.backgroundArea.hitArea = new PIXI.Rectangle(
+      0,
+      0,
+      this.props.width,
+      this.props.height
+    );
+    panable(this.backgroundArea);
+    this.backgroundArea.addEventListener('mousedown', event =>
+      this._onDownBackground(event.data.global.x, event.data.global.y, event)
+    );
+    this.backgroundArea.addEventListener('mouseup', event =>
+      this._onUpBackground(event.data.global.x, event.data.global.y, event)
+    );
+    this.backgroundArea.addEventListener(
+      'rightclick',
+      // $FlowFixMe[value-as-type]
+      (interactionEvent: PIXI.InteractionEvent) => {
+        const {
+          data: { originalEvent: event },
+        } = interactionEvent;
+        this._onRightClicked({
+          offsetX: event.offsetX,
+          offsetY: event.offsetY,
+          x: event.clientX,
+          y: event.clientY,
+          ignoreSelectedObjectNamesForContextMenu: true,
+        });
+
+        return false;
+      }
+    );
+    this.backgroundArea.addEventListener('touchstart', event => {
+      if (shouldBeHandledByPinch(event.data && event.data.originalEvent)) {
+        return;
+      }
+
+      this._onDownBackground(event.data.global.x, event.data.global.y);
+    });
+    this.backgroundArea.addEventListener('touchend', event => {
+      if (shouldBeHandledByPinch(event.data && event.data.originalEvent)) {
+        return;
+      }
+
+      this._onUpBackground(event.data.global.x, event.data.global.y);
+    });
+    this.backgroundArea.addEventListener('panmove', (event: PanMoveEvent) =>
+      this._onPanMove(
+        event.deltaX,
+        event.deltaY,
+        event.data.global.x,
+        event.data.global.y
+      )
+    );
+    this.backgroundArea.addEventListener('panend', event => this._onPanEnd());
+    this.uiPixiContainer.addChild(this.backgroundArea);
+
+    const areaRectangle = this._getAreaRectangle();
+    this.viewPosition = new ViewPosition({
+      initialViewX:
+        this.props.editorViewPosition2D.viewX === null
+          ? areaRectangle.centerX()
+          : this.props.editorViewPosition2D.viewX,
+      initialViewY:
+        this.props.editorViewPosition2D.viewY === null
+          ? areaRectangle.centerY()
+          : this.props.editorViewPosition2D.viewY,
+      width: this.props.width,
+      height: this.props.height,
+      instancesEditorSettings: this.props.instancesEditorSettings,
+    });
+
+    this.grid = new Grid({
+      viewPosition: this.viewPosition,
+      instancesEditorSettings: this.props.instancesEditorSettings,
+    });
+    this.uiPixiContainer.addChild(this.grid.getPixiObject());
+
+    this.pinchHandler = new PinchHandler({
+      canvas: this.pixiRenderer.view,
+      setZoomFactor: this.setZoomFactor,
+      getZoomFactor: this.getZoomFactor,
+      viewPosition: this.viewPosition,
+    });
+
+    this.canvasCursor = new CanvasCursor({
+      canvas: canvasArea,
+      shouldMoveView: () => this.keyboardShortcuts.shouldMoveView(),
+    });
+
+    this._instancesAdder = new InstancesAdder({
+      project: this.props.project,
+      instances: this.props.initialInstances,
+      instancesEditorSettings: this.props.instancesEditorSettings,
+    });
+
+    this._mountEditorComponents(this.props);
+    this._renderScene();
+    if (this.props.onViewPositionChanged) {
+      // Call it at the end, so that the top component knows the view position
+      // is initialized.
+      this.props.onViewPositionChanged(this.viewPosition);
+    }
+  }
+
+  /**
+   * Force the internal InstancesRenderer to be destroyed and recreated
+   * (as well as other components holding references to instances). Call
+   * this when the initial instances were recreated to ensure that there
+   * is not mismatch between renderers and the instances that were updated.
+   */
+  forceRemount = () => {
+    this._mountEditorComponents(this.props);
+  };
+
+  _mountEditorComponents(props: Props) {
+    //Remove and delete any existing editor component
+    if (this.highlightedInstance) {
+      this.uiPixiContainer.removeChild(
+        this.highlightedInstance.getPixiObject()
+      );
+    }
+    if (this.hiddenInstancesDecorations) {
+      this.uiPixiContainer.removeChild(
+        this.hiddenInstancesDecorations.getPixiObject()
+      );
+      this.hiddenInstancesDecorations.delete();
+    }
+    if (this.tileMapPaintingPreview) {
+      this.uiPixiContainer.removeChild(
+        this.tileMapPaintingPreview.getPixiObject()
+      );
+    }
+    if (this.clickInterceptor) {
+      this.uiPixiContainer.removeChild(this.clickInterceptor.getPixiObject());
+    }
+    if (this.selectedInstances) {
+      this.uiPixiContainer.removeChild(
+        this.selectedInstances.getPixiContainer()
+      );
+    }
+    if (this.instancesRenderer) {
+      this.uiPixiContainer.removeChild(
+        this.instancesRenderer.getPixiContainer()
+      );
+      this.instancesRenderer.delete();
+    }
+    if (this.selectionRectangle) {
+      this.uiPixiContainer.removeChild(this.selectionRectangle.getPixiObject());
+      this.selectionRectangle.delete();
+    }
+    if (this.windowBorder) {
+      this.uiPixiContainer.removeChild(this.windowBorder.getPixiObject());
+    }
+    if (this.windowMask) {
+      this.uiPixiContainer.removeChild(this.windowMask.getPixiObject());
+    }
+    if (this.background) {
+      this.backgroundPixiContainer.removeChild(this.background.getPixiObject());
+    }
+    if (this.profilerBar) {
+      this.uiPixiContainer.removeChild(this.profilerBar.getPixiObject());
+    }
+
+    this.instancesRenderer = new InstancesRenderer({
+      project: props.project,
+      layout: props.layout || null,
+      layersContainer: props.layersContainer,
+      globalObjectsContainer: props.globalObjectsContainer,
+      objectsContainer: props.objectsContainer,
+      instances: props.initialInstances,
+      viewPosition: this.viewPosition,
+      onOverInstance: this._onOverInstance,
+      onMoveInstance: this._onMoveInstance,
+      onMoveInstanceEnd: this._onMoveInstanceEnd,
+      onDownInstance: this._onDownInstance,
+      onUpInstance: this._onUpInstance,
+      onOutInstance: this._onOutInstance,
+      onInstanceClicked: this._onInstanceClicked,
+      onInstanceRightClicked: this._onInstanceRightClicked,
+      onInstanceDoubleClicked: this._onInstanceDoubleClicked,
+      showObjectInstancesIn3D: this._showObjectInstancesIn3D,
+    });
+    this.selectionRectangle = new SelectionRectangle({
+      instances: props.initialInstances,
+      instanceMeasurer: this.instancesRenderer.getInstanceMeasurer(),
+      toSceneCoordinates: this.viewPosition.toSceneCoordinates,
+    });
+    this.selectedInstances = new SelectedInstances({
+      instancesSelection: this.props.instancesSelection,
+      shouldDisplayHandles: this.shouldDisplayClickableHandles,
+      onResize: this._onResize,
+      onResizeEnd: this._onResizeEnd,
+      onRotate: this._onRotate,
+      onRotateEnd: this._onRotateEnd,
+      instanceMeasurer: this.instancesRenderer.getInstanceMeasurer(),
+      toCanvasCoordinates: this.viewPosition.toCanvasCoordinates,
+      getFillColor: this.getSelectedInstancesObjectFillColor,
+      screenType: this.props.screenType,
+      keyboardShortcuts: this.keyboardShortcuts,
+      onPanMove: this._onPanMove,
+      onPanEnd: this._onPanEnd,
+    });
+    this.tileMapPaintingPreview = new TileMapPaintingPreview({
+      instancesSelection: this.props.instancesSelection,
+      project: props.project,
+      globalObjectsContainer: props.globalObjectsContainer,
+      objectsContainer: props.objectsContainer,
+      getTileMapTileSelection: this.getTileMapTileSelection,
+      getRendererOfInstance: this.getRendererOfInstance,
+      getCoordinatesToRender: this.getCoordinatesToRenderTileMapPreview,
+      viewPosition: this.viewPosition,
+    });
+    this.clickInterceptor = new ClickInterceptor({
+      getTileMapTileSelection: this.getTileMapTileSelection,
+      viewPosition: this.viewPosition,
+      onClick: this._onInterceptClick,
+      onPanMove: this._onPanMove,
+      onInterceptPointerMove: () => {
+        this.fpsLimiter.notifyInteractionHappened();
+      },
+    });
+    this.highlightedInstance = new HighlightedInstance({
+      instanceMeasurer: this.instancesRenderer.getInstanceMeasurer(),
+      toCanvasCoordinates: this.viewPosition.toCanvasCoordinates,
+      isInstanceOf3DObject: this.props.isInstanceOf3DObject,
+    });
+    this.hiddenInstancesDecorations = new HiddenInstancesDecorations({
+      instances: props.initialInstances,
+      layersContainer: props.layersContainer,
+      instanceMeasurer: this.instancesRenderer.getInstanceMeasurer(),
+      toCanvasCoordinates: this.viewPosition.toCanvasCoordinates,
+    });
+    this.instancesResizer = new InstancesResizer({
+      instanceMeasurer: this.instancesRenderer.getInstanceMeasurer(),
+      instancesEditorSettings: this.props.instancesEditorSettings,
+    });
+    this.instancesRotator = new InstancesRotator(
+      this.instancesRenderer.getInstanceMeasurer()
+    );
+    this.instancesMover = new InstancesMover({
+      instanceMeasurer: this.instancesRenderer.getInstanceMeasurer(),
+      instancesEditorSettings: this.props.instancesEditorSettings,
+    });
+    this.windowBorder = new WindowBorder({
+      project: props.project,
+      layout: props.layout,
+      eventsBasedObjectVariant: props.eventsBasedObjectVariant,
+      toCanvasCoordinates: this.viewPosition.toCanvasCoordinates,
+    });
+    this.windowMask = new WindowMask({
+      project: props.project,
+      viewPosition: this.viewPosition,
+      instancesEditorSettings: this.props.instancesEditorSettings,
+    });
+    this.profilerBar = new ProfilerBar();
+
+    this.uiPixiContainer.addChild(this.selectionRectangle.getPixiObject());
+    this.uiPixiContainer.addChild(this.instancesRenderer.getPixiContainer());
+    this.uiPixiContainer.addChild(this.windowBorder.getPixiObject());
+    this.uiPixiContainer.addChild(this.windowMask.getPixiObject());
+    this.uiPixiContainer.addChild(this.selectedInstances.getPixiContainer());
+    this.uiPixiContainer.addChild(this.highlightedInstance.getPixiObject());
+    this.uiPixiContainer.addChild(
+      this.hiddenInstancesDecorations.getPixiObject()
+    );
+    this.uiPixiContainer.addChild(this.tileMapPaintingPreview.getPixiObject());
+    this.uiPixiContainer.addChild(this.clickInterceptor.getPixiObject());
+    this.uiPixiContainer.addChild(this.profilerBar.getPixiObject());
+
+    this.background = new Background({
+      width: this.props.width,
+      height: this.props.height,
+      layout: props.layout || null,
+    });
+    this.backgroundPixiContainer.addChild(this.background.getPixiObject());
+  }
+
+  /**
+   * Keyboard shortcuts are handled when the canvas is hovered by the cursor, or when it
+   * is focused - so that they can be used without having to click on the canvas first,
+   * consistently with the mouse wheel zoom that already works when only hovering.
+   */
+  _shouldHandleKeyboardShortcuts = (): boolean =>
+    !!this.pixiRenderer &&
+    // Don't handle shortcuts while a text is edited or a dialog is opened.
+    !isUserTyping() &&
+    !(
+      document.activeElement &&
+      document.activeElement.closest('[role="dialog"]')
+    ) &&
+    (this._isPointerOverCanvas ||
+      document.activeElement === this.pixiRenderer.view);
+
+  componentWillUnmount() {
+    // This is an antipattern and is theoretically not needed, but help
+    // to protect against renders after the component is unmounted.
+    this._unmounted = true;
+
+    if (this._stopNativeAppActivity) {
+      this._stopNativeAppActivity();
+      this._stopNativeAppActivity = null;
+    }
+    if (this.keyboardShortcuts) {
+      const { onKeyDown, onKeyUp, resetModifiers } = this.keyboardShortcuts;
+      window.removeEventListener('keydown', onKeyDown, true);
+      window.removeEventListener('keyup', onKeyUp, true);
+      window.removeEventListener('blur', resetModifiers);
+    }
+
+    // We've seen all those elements being undefined in some cases, so
+    // by security, check that they are defined before deleting them.
+    if (this.selectionRectangle) {
+      this.selectionRectangle.delete();
+    }
+    if (this.hiddenInstancesDecorations) {
+      this.hiddenInstancesDecorations.delete();
+    }
+    if (this.instancesRenderer) {
+      this.instancesRenderer.delete();
+    }
+    if (this._instancesAdder) {
+      this._instancesAdder.unmount();
+    }
+    if (this.pinchHandler) {
+      this.pinchHandler.unmount();
+    }
+    if (this.longTouchHandler) {
+      this.longTouchHandler.unmount();
+    }
+    if (this.nextFrame) cancelAnimationFrame(this.nextFrame);
+    stopPIXITicker();
+    if (this.uiPixiContainer) {
+      this.uiPixiContainer.destroy();
+    }
+    if (this.backgroundPixiContainer) {
+      this.backgroundPixiContainer.destroy();
+    }
+    if (this.pixiRenderer) {
+      this.pixiRenderer.destroy();
+    }
+    const { threeRenderer } = this;
+    if (threeRenderer) {
+      // Release the WebGL context (shared with PixiJS) right away: otherwise its
+      // GPU memory is only freed when garbage collected, and a new one is
+      // created each time the editor is shown again.
+      threeRenderer.dispose();
+      threeRenderer.forceContextLoss();
+      this.threeRenderer = null;
+    }
+  }
+
+  // To be updated, see https://reactjs.org/docs/react-component.html#unsafe_componentwillreceiveprops.
+  UNSAFE_componentWillReceiveProps(nextProps: Props) {
+    if (
+      nextProps.width !== this.props.width ||
+      nextProps.height !== this.props.height
+    ) {
+      // Ensure we don't resize to 0, which is invalid for PixiJS/WebGL.
+      const width = nextProps.width || 1;
+      const height = nextProps.height || 1;
+
+      // Mirror what the render loop does before each frame (see InstancesRenderer.render),
+      // to ensure the WebGL state is clean and avoid crashes when resizing renderers
+      // (PixiJS's resize triggers internal shader uniform syncing,
+      // which will crash if Three.js's stale program is still active).
+      // Wrap in try/catch: resize can run while resources are being reloaded
+      // (textures disposed), and interacting with PixiJS/Three.js state in that
+      // window could crash. A failed resize is recoverable on the next frame.
+      try {
+        if (this.threeRenderer) {
+          this.threeRenderer.resetState();
+
+          // Actually do not reset PixiJS renderer as we get crashes when doing it
+          // ("Cannot read properties of null (reading '_batchEnabled')").
+          // this.pixiRenderer.reset();
+        }
+
+        this.pixiRenderer.resize(width, height);
+        if (this.threeRenderer) {
+          this.threeRenderer.setSize(width, height);
+        }
+      } catch (error) {
+        console.error(
+          'Error while resizing the renderers, will be retried on next frame:',
+          error
+        );
+      }
+      this.viewPosition.resize(width, height);
+      this.backgroundArea.hitArea = new PIXI.Rectangle(0, 0, width, height);
+      this.background.resize(width, height);
+
+      // Avoid flickering that could happen while waiting for next animation frame.
+      this.fpsLimiter.forceNextUpdate();
+      this._renderScene();
+    }
+
+    if (
+      nextProps.instancesEditorSettings !== this.props.instancesEditorSettings
+    ) {
+      this.grid.setInstancesEditorSettings(nextProps.instancesEditorSettings);
+      this.instancesMover.setInstancesEditorSettings(
+        nextProps.instancesEditorSettings
+      );
+      this.instancesResizer.setInstancesEditorSettings(
+        nextProps.instancesEditorSettings
+      );
+      this.windowMask.setInstancesEditorSettings(
+        nextProps.instancesEditorSettings
+      );
+      this.viewPosition.setInstancesEditorSettings(
+        nextProps.instancesEditorSettings
+      );
+      this._instancesAdder.setInstancesEditorSettings(
+        nextProps.instancesEditorSettings
+      );
+    }
+
+    if (nextProps.screenType !== this.props.screenType) {
+      this.selectedInstances.setScreenType(this.props.screenType);
+    }
+
+    if (
+      this.props.layout !== nextProps.layout ||
+      this.props.layersContainer !== nextProps.layersContainer ||
+      this.props.objectsContainer !== nextProps.objectsContainer ||
+      this.props.initialInstances !== nextProps.initialInstances ||
+      this.props.project !== nextProps.project
+    ) {
+      this._mountEditorComponents(nextProps);
+    }
+
+    // For avoiding useless renderings, which is costly for CPU/GPU, when the editor
+    // is not displayed, `pauseRendering` prop can be set to true.
+    if (nextProps.pauseRendering && !this.props.pauseRendering)
+      this.pauseSceneRendering('inactive');
+
+    if (!nextProps.pauseRendering && this.props.pauseRendering)
+      this.resumeSceneRendering('inactive');
+  }
+
+  /**
+   * Delete instance renderers of the specified objects, which will then be recreated during
+   * the next render. Call this when an object resources may have changed (for example, a modified image),
+   * and you want the instances of objects to reflect the changes.
+   * See also ResourcesLoader and PixiResourcesLoader.
+   * @param {string} objectName The name of the object for which instance must be re-rendered.
+   */
+  resetInstanceRenderersFor = (objectName: string) => {
+    if (this.instancesRenderer)
+      this.instancesRenderer.resetInstanceRenderersFor(objectName);
+  };
+
+  zoomBy = (value: number) => {
+    this.setZoomFactor(this.getZoomFactor() * value);
+  };
+
+  /**
+   * Zoom and scroll so that the cursor stays on the same position scene-wise.
+   */
+  zoomOnCursorBy(value: number) {
+    const beforeZoomCursorPosition = this.getLastCursorSceneCoordinates();
+    if (!beforeZoomCursorPosition) return;
+    this.setZoomFactor(this.getZoomFactor() * value);
+    const afterZoomCursorPosition = this.getLastCursorSceneCoordinates();
+    if (!afterZoomCursorPosition) return;
+    // Compensate for the cursor change in position
+    this.scrollBy(
+      beforeZoomCursorPosition[0] - afterZoomCursorPosition[0],
+      beforeZoomCursorPosition[1] - afterZoomCursorPosition[1]
+    );
+  }
+
+  getTileMapTileSelection = (): any => {
+    return this.props.tileMapTileSelection;
+  };
+
+  getSelectedInstancesObjectFillColor = (
+    isLocked: boolean
+  ): {| color: number, alpha: number |} => {
+    if (this.props.tileMapTileSelection) return { color: 0xfff, alpha: 0 };
+    return { color: isLocked ? 0xbc5753 : 0x6868e8, alpha: 1 };
+  };
+
+  shouldDisplayClickableHandles = (): any => !this.props.tileMapTileSelection;
+
+  getZoomFactor = (): any => {
+    return this.props.instancesEditorSettings.zoomFactor;
+  };
+
+  setZoomFactor = (zoomFactor: number) => {
+    this.props.instancesEditorSettings.zoomFactor = clampInstancesEditorZoom(
+      zoomFactor
+    );
+
+    this.props.onInstancesEditorSettingsMutated(
+      this.props.instancesEditorSettings
+    );
+  };
+
+  /**
+   * Immediately add serialized instances at the given
+   * position (in scene coordinates).
+   */
+  addSerializedInstances = (options: {|
+    position: [number, number],
+    copyReferential: [number, number],
+    serializedInstances: Array<Object>,
+    addInstancesInTheForeground?: boolean,
+    doesObjectExistInContext: string => boolean,
+  |}): Array<gdInitialInstance> => {
+    return this._instancesAdder.addSerializedInstances(options);
+  };
+
+  snapSelection = (instances: gdInitialInstance[]) => {
+    this.instancesMover.snapSelection(instances);
+  };
+
+  /**
+   * Immediately add instances for the specified objects at the given
+   * position (in scene coordinates) given their names.
+   */
+  addInstances = (
+    pos: [number, number],
+    objectNames: Array<string>,
+    layer: string
+  ): Array<gdInitialInstance> => {
+    return this._instancesAdder.addInstances(pos, objectNames, layer);
+  };
+
+  _onMouseMove = (x: number, y: number) => {
+    this.lastCursorX = x;
+    this.lastCursorY = y;
+  };
+
+  _onInterceptClick = (sceneCoordinates: Array<{| x: number, y: number |}>) => {
+    const {
+      tileMapTileSelection,
+      instancesSelection,
+      globalObjectsContainer,
+      objectsContainer,
+    } = this.props;
+    if (!tileMapTileSelection) {
+      return;
+    }
+    const selectedInstances = instancesSelection.getSelectedInstances();
+    if (selectedInstances.length !== 1) return;
+    const selectedInstance = selectedInstances[0];
+    const object = getObjectByName(
+      globalObjectsContainer,
+      objectsContainer,
+      selectedInstance.getObjectName()
+    );
+    if (!object) return;
+    const renderedInstance = this.getRendererOfInstance(selectedInstance);
+    if (
+      object.getType() === 'TileMap::SimpleTileMap' &&
+      renderedInstance &&
+      // $FlowFixMe[incompatible-type] - We are confident the renderedInstance is an instance of RenderedSimpleTileMapInstance.
+      !!renderedInstance.getEditableTileMap
+    ) {
+      // $FlowFixMe[incompatible-type]
+      const editableTileMap = renderedInstance.getEditableTileMap();
+      if (!editableTileMap) {
+        console.error(
+          `Could not find the editable tile map for instance of object ${selectedInstance.getObjectName()}`
+        );
+        return;
+      }
+      const sceneToTileMapTransformation = new AffineTransformation();
+      const tileMapToSceneTransformation = new AffineTransformation();
+      const scales = updateSceneToTileMapTransformation(
+        selectedInstance,
+        // $FlowFixMe[incompatible-type]
+        renderedInstance,
+        sceneToTileMapTransformation,
+        tileMapToSceneTransformation
+      );
+      if (!scales) return;
+      const { scaleX, scaleY } = scales;
+      const tileSet = getTileSet(object);
+      if (!tileSet.atlasImage) {
+        console.warn('Trying to paint on a tilemap without an atlas image.');
+        return;
+      }
+      if (isTileSetBadlyConfigured(tileSet)) {
+        console.warn(
+          'Trying to paint on a tilemap with a badly configured tileset.'
+        );
+        return;
+      }
+      const tileMapGridCoordinates = getTilesGridCoordinatesFromPointerSceneCoordinates(
+        {
+          tileMapTileSelection,
+          coordinates: sceneCoordinates,
+          tileSize: tileSet.tileSize,
+          sceneToTileMapTransformation,
+        }
+      );
+
+      let shouldTrimAfterOperations = false;
+
+      // Handle picker tool: select the tile that was clicked on the scene
+      if (tileMapTileSelection.kind === 'picker') {
+        if (tileMapGridCoordinates.length === 0) return;
+        const { topLeftCorner } = tileMapGridCoordinates[0];
+
+        const clickX = topLeftCorner.x;
+        const clickY = topLeftCorner.y;
+
+        const layer = editableTileMap.getTileLayer(0);
+        if (!layer) return;
+
+        // Get the tile ID at the clicked position
+        const tileId = layer.getTileId(clickX, clickY);
+
+        // If there's no tile at this position, do nothing
+        if (tileId === -1) return;
+
+        // Convert the tile ID to tileset grid coordinates
+        const tilesetCoordinates = getGridCoordinatesFromTileId({
+          id: tileId,
+          columnCount: tileSet.columnCount,
+        });
+
+        // Select this tile in the tileset and restore the previous tool
+        const newSelection = createSelectionWithPreviousTool(
+          this._previousToolBeforePicker,
+          [tilesetCoordinates, tilesetCoordinates],
+          { horizontal: false, vertical: false }
+        );
+        this.props.onSelectTileMapTile(newSelection);
+
+        return;
+      }
+
+      if (tileMapTileSelection.kind === 'floodfill') {
+        // Flood fill: get the single clicked grid coordinate.
+        if (tileMapGridCoordinates.length === 0) return;
+        const { topLeftCorner, tileCoordinates } = tileMapGridCoordinates[0];
+        if (!tileCoordinates) return;
+
+        const clickX = topLeftCorner.x;
+        const clickY = topLeftCorner.y;
+
+        const layer = editableTileMap.getTileLayer(0);
+        if (!layer) return;
+
+        // Get the tile ID of the clicked position (the tile being replaced).
+        const targetTileId = layer.getTileId(clickX, clickY);
+
+        const newTileId = getTileIdFromGridCoordinates({
+          columnCount: tileSet.columnCount,
+          ...tileCoordinates,
+        });
+        const tileDefinition = editableTileMap.getTileDefinition(newTileId);
+        if (!tileDefinition) return;
+
+        // BFS flood fill over tiles matching the target tile (4-directional).
+        const dimX = editableTileMap.getDimensionX();
+        const dimY = editableTileMap.getDimensionY();
+        const queue: Array<{| x: number, y: number |}> = [];
+        const visited = new Set<string>();
+
+        if (clickX >= 0 && clickX < dimX && clickY >= 0 && clickY < dimY) {
+          queue.push({ x: clickX, y: clickY });
+          visited.add(`${clickX},${clickY}`);
+        }
+
+        while (queue.length > 0) {
+          const current = queue.shift();
+
+          if (
+            // $FlowFixMe[incompatible-use]
+            current.x < 0 ||
+            // $FlowFixMe[incompatible-use]
+            current.x >= dimX ||
+            // $FlowFixMe[incompatible-use]
+            current.y < 0 ||
+            // $FlowFixMe[incompatible-use]
+            current.y >= dimY
+          )
+            continue;
+
+          // $FlowFixMe[incompatible-use]
+          const currentTileId = layer.getTileId(current.x, current.y);
+          if (currentTileId !== targetTileId) continue;
+
+          // $FlowFixMe[incompatible-use]
+          editableTileMap.setTile(current.x, current.y, 0, newTileId);
+          editableTileMap.flipTileOnX(
+            // $FlowFixMe[incompatible-use]
+            current.x,
+            // $FlowFixMe[incompatible-use]
+            current.y,
+            0,
+            tileMapTileSelection.flipHorizontally
+          );
+          editableTileMap.flipTileOnY(
+            // $FlowFixMe[incompatible-use]
+            current.x,
+            // $FlowFixMe[incompatible-use]
+            current.y,
+            0,
+            tileMapTileSelection.flipVertically
+          );
+
+          // Add neighbors if not already visited
+          const neighbors = [
+            // $FlowFixMe[incompatible-use]
+            { x: current.x - 1, y: current.y },
+            // $FlowFixMe[incompatible-use]
+            { x: current.x + 1, y: current.y },
+            // $FlowFixMe[incompatible-use]
+            { x: current.x, y: current.y - 1 },
+            // $FlowFixMe[incompatible-use]
+            { x: current.x, y: current.y + 1 },
+          ];
+
+          for (const neighbor of neighbors) {
+            const key = `${neighbor.x},${neighbor.y}`;
+            if (!visited.has(key)) {
+              visited.add(key);
+              queue.push(neighbor);
+            }
+          }
+        }
+      } else if (getTileMapPaintingSelection(tileMapTileSelection)) {
+        const paintingSelection = getTileMapPaintingSelection(
+          tileMapTileSelection
+        );
+        if (!paintingSelection) return;
+        shouldTrimAfterOperations = editableTileMap.isEmpty();
+        // TODO: Optimize list execution to make sure the most important size changing operations are done first.
+        let cumulatedUnshiftedRows = 0,
+          cumulatedUnshiftedColumns = 0;
+
+        const layer = editableTileMap.getTileLayer(0);
+        if (!layer) return;
+
+        tileMapGridCoordinates.forEach(
+          ({ bottomRightCorner, topLeftCorner, tileCoordinates }) => {
+            if (!tileCoordinates) return;
+            const tileId = getTileIdFromGridCoordinates({
+              columnCount: tileSet.columnCount,
+              ...tileCoordinates,
+            });
+
+            const tileDefinition = editableTileMap.getTileDefinition(tileId);
+            if (!tileDefinition) return;
+
+            for (
+              let gridX = topLeftCorner.x;
+              gridX <= bottomRightCorner.x;
+              gridX++
+            ) {
+              for (
+                let gridY = topLeftCorner.y;
+                gridY <= bottomRightCorner.y;
+                gridY++
+              ) {
+                // If rows or columns have been unshifted in the previous tile setting operations,
+                // we have to take them into account for the current coordinates.
+                const x = gridX + cumulatedUnshiftedColumns;
+                const y = gridY + cumulatedUnshiftedRows;
+                const rowsToAppend = Math.max(
+                  0,
+                  y - (editableTileMap.getDimensionY() - 1)
+                );
+                const columnsToAppend = Math.max(
+                  0,
+                  x - (editableTileMap.getDimensionX() - 1)
+                );
+                const rowsToUnshift = Math.abs(Math.min(0, y));
+                const columnsToUnshift = Math.abs(Math.min(0, x));
+                if (
+                  rowsToAppend > 0 ||
+                  columnsToAppend > 0 ||
+                  rowsToUnshift > 0 ||
+                  columnsToUnshift > 0
+                ) {
+                  editableTileMap.increaseDimensions(
+                    columnsToAppend,
+                    columnsToUnshift,
+                    rowsToAppend,
+                    rowsToUnshift
+                  );
+                }
+                const newX = x + columnsToUnshift;
+                const newY = y + rowsToUnshift;
+
+                editableTileMap.setTile(newX, newY, 0, tileId);
+                editableTileMap.flipTileOnX(
+                  newX,
+                  newY,
+                  0,
+                  paintingSelection.flipHorizontally
+                );
+                editableTileMap.flipTileOnY(
+                  newX,
+                  newY,
+                  0,
+                  paintingSelection.flipVertically
+                );
+
+                cumulatedUnshiftedRows += rowsToUnshift;
+                cumulatedUnshiftedColumns += columnsToUnshift;
+                // The instance angle is not considered when moving the instance after
+                // rows/columns were added/removed because the instance position does not
+                // include the rotation transformation. Otherwise, we could have used
+                // tileMapToSceneTransformation to get the new position.
+                selectedInstance.setX(
+                  selectedInstance.getX() -
+                    columnsToUnshift * (tileSet.tileSize * scaleX)
+                );
+                selectedInstance.setY(
+                  selectedInstance.getY() -
+                    rowsToUnshift * (tileSet.tileSize * scaleY)
+                );
+                if (selectedInstance.hasCustomSize()) {
+                  selectedInstance.setCustomWidth(
+                    selectedInstance.getCustomWidth() +
+                      tileSet.tileSize *
+                        scaleX *
+                        (columnsToAppend + columnsToUnshift)
+                  );
+                  selectedInstance.setCustomHeight(
+                    selectedInstance.getCustomHeight() +
+                      tileSet.tileSize * scaleY * (rowsToAppend + rowsToUnshift)
+                  );
+                }
+              }
+            }
+          }
+        );
+      } else if (tileMapTileSelection.kind === 'erase') {
+        const { bottomRightCorner, topLeftCorner } = tileMapGridCoordinates[0];
+        for (
+          let gridX = topLeftCorner.x;
+          gridX <= bottomRightCorner.x;
+          gridX++
+        ) {
+          for (
+            let gridY = topLeftCorner.y;
+            gridY <= bottomRightCorner.y;
+            gridY++
+          ) {
+            editableTileMap.removeTile(gridX, gridY, 0);
+          }
+        }
+
+        shouldTrimAfterOperations = true;
+      } else {
+        return;
+      }
+
+      if (shouldTrimAfterOperations) {
+        const trimData = editableTileMap.trimEmptyColumnsAndRowToFitLayer(0);
+        if (trimData) {
+          const {
+            shiftedRows,
+            shiftedColumns,
+            poppedRows,
+            poppedColumns,
+          } = trimData;
+          // The instance angle is not considered when moving the instance after
+          // rows/columns were added/removed because the instance position does not
+          // include the rotation transformation. Otherwise, we could have used
+          // tileMapToSceneTransformation to get the new position.
+          selectedInstance.setX(
+            selectedInstance.getX() +
+              shiftedColumns * (tileSet.tileSize * scaleX)
+          );
+          selectedInstance.setY(
+            selectedInstance.getY() + shiftedRows * (tileSet.tileSize * scaleY)
+          );
+          if (selectedInstance.hasCustomSize()) {
+            selectedInstance.setCustomWidth(
+              selectedInstance.getCustomWidth() -
+                tileSet.tileSize * scaleX * (poppedColumns + shiftedColumns)
+            );
+            selectedInstance.setCustomHeight(
+              selectedInstance.getCustomHeight() -
+                tileSet.tileSize * scaleY * (poppedRows + shiftedRows)
+            );
+          }
+        }
+      }
+      // $FlowIgnore
+      renderedInstance.updatePixiTileMap();
+      selectedInstance.setRawStringProperty(
+        'tilemap',
+        JSON.stringify(editableTileMap.toJSObject())
+      );
+      this.props.onInstancesResized([selectedInstance]);
+    }
+  };
+
+  getRendererOfInstance = (instance: gdInitialInstance): any => {
+    return this.instancesRenderer.getRendererOfInstance(
+      instance.getLayer(),
+      instance
+    );
+  };
+
+  _onDownBackground = (x: number, y: number, event?: PointerEvent) => {
+    this.lastCursorX = x;
+    this.lastCursorY = y;
+    this.pixiRenderer.view.focus();
+
+    // KeyboardShortcuts.shouldMoveView cannot be used here because
+    // the click event fires first on the background, then on the pixi
+    // view which KeyboardShortcuts listens to. So KeyboardShortcuts
+    // will always be late.
+    const shouldMoveView =
+      this.keyboardShortcuts.shouldMoveView() ||
+      (event ? event.button === MID_MOUSE_BUTTON : false);
+
+    // Selection rectangle is only drawn in _onPanMove,
+    // which can happen a few milliseconds after a background
+    // click/touch - enough to have the selection rectangle being
+    // offset from the first click - which looks laggy. Set
+    // the start position now.
+    if (!shouldMoveView) {
+      this.selectionRectangle.startSelectionRectangle(x, y);
+    }
+  };
+
+  _onPanMove = (deltaX: number, deltaY: number, x: number, y: number) => {
+    this.fpsLimiter.notifyInteractionHappened();
+    if (this.keyboardShortcuts.shouldMoveView()) {
+      const sceneDeltaX = deltaX / this.getZoomFactor();
+      const sceneDeltaY = deltaY / this.getZoomFactor();
+
+      this.scrollBy(-sceneDeltaX, -sceneDeltaY);
+      return;
+    }
+
+    if (this.selectionRectangle.hasStartedSelectionRectangle()) {
+      this.selectionRectangle.updateSelectionRectangle(x, y);
+      return;
+    }
+  };
+
+  _getLayersLocks = (): any => {
+    const { layersContainer } = this.props;
+    const layersLocks = {};
+    for (let i = 0; i < layersContainer.getLayersCount(); i++) {
+      const layer = layersContainer.getLayerAt(i);
+      // $FlowFixMe[prop-missing]
+      layersLocks[layersContainer.getLayerAt(i).getName()] =
+        !layer.getVisibility() || layer.isLocked();
+    }
+    return layersLocks;
+  };
+
+  _onUpBackground = (x: number, y: number, event?: PointerEvent) => {
+    if (this.selectionRectangle.hasStartedSelectionRectangle()) {
+      this._selectInstanceInsideSelectionRectangle();
+    }
+  };
+
+  _onPanEnd = () => {
+    // When a pan is ended, this can be that either the user was making
+    // a selection, or that the user was moving the view.
+    if (this.selectionRectangle.hasStartedSelectionRectangle()) {
+      this._selectInstanceInsideSelectionRectangle();
+    }
+  };
+
+  _selectInstanceInsideSelectionRectangle = () => {
+    let instancesSelected = this.selectionRectangle.endSelectionRectangle();
+
+    this.props.instancesSelection.selectInstances({
+      instances: instancesSelected,
+      multiSelect: this.keyboardShortcuts.shouldMultiSelect(),
+      layersLocks: this._getLayersLocks(),
+    });
+    instancesSelected = this.props.instancesSelection.getSelectedInstances();
+    this.props.onInstancesSelected(instancesSelected);
+  };
+
+  _onInstanceClicked = (instance: gdInitialInstance) => {
+    this.fpsLimiter.notifyInteractionHappened();
+    this.pixiRenderer.view.focus();
+  };
+
+  _onInstanceRightClicked = (coordinates: {|
+    offsetX: number,
+    offsetY: number,
+    x: number,
+    y: number,
+  |}) => {
+    this._onRightClicked({
+      ...coordinates,
+      ignoreSelectedObjectNamesForContextMenu: false,
+    });
+  };
+
+  _onRightClicked = ({
+    offsetX,
+    offsetY,
+    x,
+    y,
+    ignoreSelectedObjectNamesForContextMenu,
+  }: {|
+    offsetX: number,
+    offsetY: number,
+    x: number,
+    y: number,
+    ignoreSelectedObjectNamesForContextMenu?: boolean,
+  |}) => {
+    this.lastContextMenuX = offsetX;
+    this.lastContextMenuY = offsetY;
+    if (this.props.onContextMenu) {
+      this.props.onContextMenu(x, y, !!ignoreSelectedObjectNamesForContextMenu);
+    }
+  };
+
+  _onInstanceDoubleClicked = (instance: gdInitialInstance) => {
+    if (!this.keyboardShortcuts.shouldIgnoreDoubleClick()) {
+      this.props.onInstanceDoubleClicked(instance);
+    }
+  };
+
+  _onOverInstance = (instance: gdInitialInstance) => {
+    if (!this.instancesMover.isMoving())
+      this.highlightedInstance.setInstance(instance);
+  };
+
+  _onDownInstance = (
+    instance: gdInitialInstance,
+    sceneX: number,
+    sceneY: number
+  ) => {
+    this.fpsLimiter.notifyInteractionHappened();
+
+    this.hasCursorMovedSinceItIsDown = false;
+    this._instanceUnderPointerDown = instance;
+
+    if (this.keyboardShortcuts.shouldMoveView()) {
+      // If the user wants to move the view, discard the click on an instance:
+      // it's just the beginning of the user panning the view.
+      return;
+    }
+
+    if (
+      this.keyboardShortcuts.shouldStartRectangleSelectionInsteadOfSelecting()
+    ) {
+      const canvasPosition = this.viewPosition.toCanvasCoordinates(
+        sceneX,
+        sceneY
+      );
+      this.selectionRectangle.startSelectionRectangle(
+        canvasPosition[0],
+        canvasPosition[1]
+      );
+      return;
+    }
+
+    // MultiSelect is not done here because it's the same modifier as
+    // shouldStartRectangleSelectionInsteadOfSelecting.
+    // It's done in _onUpInstance instead.
+    this.props.instancesSelection.selectInstance({
+      instance,
+      multiSelect: this.keyboardShortcuts.shouldMultiSelect(),
+      layersLocks: this._getLayersLocks(),
+    });
+    if (this.props.onInstancesSelected) {
+      this.props.onInstancesSelected(
+        this.props.instancesSelection.getSelectedInstances()
+      );
+    }
+
+    this.instancesMover.startMove(sceneX, sceneY);
+  };
+
+  _onOutInstance = (instance: gdInitialInstance) => {
+    if (instance === this.highlightedInstance.getInstance())
+      this.highlightedInstance.setInstance(null);
+  };
+
+  _onUpInstance = (
+    instance: gdInitialInstance,
+    sceneX: number,
+    sceneY: number
+  ) => {
+    // Select instances on a click.
+    // - In case of standard selection, it's already done in _onDownInstance
+    // but selecting the same instance twice has no side effect on the
+    // selection.
+    // - For MultiSelect, the selection is not done in _onDownInstance.
+    // Releasing the pointer after another interaction (rotating, resizing,
+    // dropping an object...) must not select the instance under the pointer.
+    const isUpOnInstanceUnderPointerDown =
+      !!this._instanceUnderPointerDown &&
+      this._instanceUnderPointerDown.ptr === instance.ptr;
+    this._instanceUnderPointerDown = null;
+    if (isUpOnInstanceUnderPointerDown && !this.hasCursorMovedSinceItIsDown) {
+      this.props.instancesSelection.selectInstance({
+        instance,
+        multiSelect: this.keyboardShortcuts.shouldMultiSelect(),
+        layersLocks: this._getLayersLocks(),
+      });
+      if (this.props.onInstancesSelected) {
+        this.props.onInstancesSelected(
+          this.props.instancesSelection.getSelectedInstances()
+        );
+      }
+
+      if (this.selectionRectangle.hasStartedSelectionRectangle()) {
+        this._selectInstanceInsideSelectionRectangle();
+      }
+    }
+  };
+
+  _onMoveInstance = (
+    instance: gdInitialInstance,
+    deltaX: number,
+    deltaY: number
+  ) => {
+    this.fpsLimiter.notifyInteractionHappened();
+
+    const isMovingForTheFirstTimeSinceItIsDown = !this
+      .hasCursorMovedSinceItIsDown;
+    this.hasCursorMovedSinceItIsDown = true;
+
+    const sceneDeltaX = deltaX / this.getZoomFactor();
+    const sceneDeltaY = deltaY / this.getZoomFactor();
+
+    // It is possible for the user to start moving an instance, then press the button
+    // to move the view, move it, then unpress it and continue to move the instance.
+    // This means that while we're in "_onMoveInstance", we must handle view moving.
+    if (this.keyboardShortcuts.shouldMoveView()) {
+      this.scrollBy(-sceneDeltaX, -sceneDeltaY);
+      return;
+    }
+
+    if (
+      this.selectionRectangle.hasStartedSelectionRectangle() &&
+      this.selectionRectangle.selectionRectangleEnd
+    ) {
+      this.selectionRectangle.updateSelectionRectangle(
+        this.selectionRectangle.selectionRectangleEnd.x + deltaX,
+        this.selectionRectangle.selectionRectangleEnd.y + deltaY
+      );
+      return;
+    }
+
+    if (
+      this.keyboardShortcuts.shouldCloneInstances() &&
+      isMovingForTheFirstTimeSinceItIsDown
+    ) {
+      const selectedInstances = this.props.instancesSelection.getSelectedInstances();
+      for (let i = 0; i < selectedInstances.length; i++) {
+        const instance = selectedInstances[i];
+        this.props.initialInstances
+          .insertInitialInstance(instance)
+          .resetPersistentUuid();
+      }
+    }
+
+    if (!this.props.instancesSelection.isInstanceSelected(instance)) {
+      this._onInstanceClicked(instance);
+    }
+
+    const selectedInstances = this.props.instancesSelection.getSelectedInstances();
+    this.instancesMover.moveBy(
+      selectedInstances,
+      sceneDeltaX,
+      sceneDeltaY,
+      this.keyboardShortcuts.shouldFollowAxis(),
+      this.keyboardShortcuts.shouldNotSnapToGrid()
+    );
+  };
+
+  _onMoveInstanceEnd = () => {
+    if (!this.hasCursorMovedSinceItIsDown) {
+      return;
+    }
+
+    if (this.selectionRectangle.hasStartedSelectionRectangle()) {
+      this._selectInstanceInsideSelectionRectangle();
+      return;
+    }
+
+    this.instancesMover.endMove();
+
+    const selectedInstances = this.props.instancesSelection.getSelectedInstances();
+    this.props.onInstancesMoved(selectedInstances);
+  };
+
+  _onResize = (
+    deltaX: number,
+    deltaY: number,
+    grabbingLocation: ResizeGrabbingLocation
+  ) => {
+    this.fpsLimiter.notifyInteractionHappened();
+    const sceneDeltaX = deltaX / this.getZoomFactor();
+    const sceneDeltaY = deltaY / this.getZoomFactor();
+
+    const selectedInstances = this.props.instancesSelection.getSelectedInstances();
+    const forceProportional =
+      this.props.screenType === 'touch' &&
+      canMoveOnX(grabbingLocation) &&
+      canMoveOnY(grabbingLocation);
+    const proportional =
+      forceProportional || this.keyboardShortcuts.shouldResizeProportionally();
+    this.instancesResizer.resizeBy(
+      selectedInstances,
+      sceneDeltaX,
+      sceneDeltaY,
+      grabbingLocation,
+      proportional,
+      this.keyboardShortcuts.shouldNotSnapToGrid()
+    );
+  };
+
+  _onResizeEnd = () => {
+    this.instancesResizer.endResize();
+
+    const selectedInstances = this.props.instancesSelection.getSelectedInstances();
+    this.props.onInstancesResized(selectedInstances);
+  };
+
+  _onRotate = (deltaX: number, deltaY: number) => {
+    this.fpsLimiter.notifyInteractionHappened();
+    const sceneDeltaX = deltaX / this.getZoomFactor();
+    const sceneDeltaY = deltaY / this.getZoomFactor();
+
+    const selectedInstances = this.props.instancesSelection.getSelectedInstances();
+    this.instancesRotator.rotateBy(
+      selectedInstances,
+      sceneDeltaX,
+      sceneDeltaY,
+      this.keyboardShortcuts.shouldResizeProportionally()
+    );
+  };
+
+  _onRotateEnd = () => {
+    this.instancesRotator.endRotate();
+
+    const selectedInstances = this.props.instancesSelection.getSelectedInstances();
+    this.props.onInstancesRotated(selectedInstances);
+  };
+
+  clearHighlightedInstance = () => {
+    this.highlightedInstance.setInstance(null);
+  };
+
+  /**
+   * Delete the temporary instances added while an object is dragged - ensuring
+   * no reference to it is kept.
+   */
+  _deleteTemporaryInstances = () => {
+    // A temporary instance can be the highlighted one (it gets highlighted on
+    // hover while being dragged over the canvas). Clear the reference before
+    // it's deleted, otherwise the rendering would read the freed instance and
+    // show a corrupted tooltip and a "phantom" default-texture instance.
+    if (
+      this._instancesAdder.isTemporaryInstance(
+        this.highlightedInstance.getInstance()
+      )
+    ) {
+      this.highlightedInstance.setInstance(null);
+    }
+    // Out of caution: a temporary instance is not expected to be selected
+    // (selection only happens on a click on the canvas), but make sure the
+    // selection never keeps a reference to a soon-to-be-freed instance.
+    this.props.instancesSelection
+      .getSelectedInstances()
+      .slice()
+      .forEach(instance => {
+        if (this._instancesAdder.isTemporaryInstance(instance)) {
+          this.props.instancesSelection.unselectInstance(instance);
+        }
+      });
+    this._instancesAdder.deleteTemporaryInstances();
+  };
+
+  // Debounce function to avoid storing history for each pixel move when user
+  // keeps pressing an arrow key.
+  // $FlowFixMe[missing-local-annot]
+  onInstancesMovedDebounced = (debounce(this.props.onInstancesMoved, 50, {
+    trailing: true,
+  }): any);
+
+  moveSelection = (x: number, y: number) => {
+    this.fpsLimiter.notifyInteractionHappened();
+    const selectedInstances = this.props.instancesSelection.getSelectedInstances();
+    const unlockedSelectedInstances = selectedInstances.filter(
+      instance => !instance.isLocked()
+    );
+    unlockedSelectedInstances.forEach(instance => {
+      instance.setX(instance.getX() + x);
+      instance.setY(instance.getY() + y);
+    });
+    this.onInstancesMovedDebounced(unlockedSelectedInstances);
+  };
+
+  cancelClickInterception = (): boolean => {
+    if (this.clickInterceptor && this.clickInterceptor.isIntercepting()) {
+      this.clickInterceptor.cancelClickInterception();
+      return true;
+    }
+    return false;
+  };
+
+  scrollBy(x: number, y: number) {
+    this.fpsLimiter.notifyInteractionHappened();
+    this.viewPosition.scrollBy(x, y);
+
+    if (this.props.onViewPositionChanged) {
+      this.props.onViewPositionChanged(this.viewPosition);
+    }
+  }
+
+  scrollTo(x: number, y: number) {
+    this.fpsLimiter.notifyInteractionHappened();
+    this.viewPosition.scrollTo(x, y);
+    if (this.props.onViewPositionChanged) {
+      this.props.onViewPositionChanged(this.viewPosition);
+    }
+  }
+
+  fitViewToRectangle(
+    rectangle: Rectangle,
+    { adaptZoom }: {| adaptZoom: boolean |}
+  ) {
+    const idealZoom = this.viewPosition.fitToRectangle(rectangle);
+    if (adaptZoom) this.setZoomFactor(idealZoom);
+    if (this.props.onViewPositionChanged) {
+      this.props.onViewPositionChanged(this.viewPosition);
+    }
+  }
+
+  getBoundingClientRect(): any {
+    if (!this.canvasArea) return { left: 0, top: 0, right: 0, bottom: 0 };
+    return this.canvasArea.getBoundingClientRect();
+  }
+
+  getContentAABB = (): Rectangle | null => {
+    const { initialInstances } = this.props;
+    if (initialInstances.getInstancesCount() === 0) return null;
+
+    const instanceMeasurer = this.instancesRenderer.getInstanceMeasurer();
+    let contentAABB: Rectangle | null = null;
+    const getInstanceRectangle = new gd.InitialInstanceJSFunctor();
+    // $FlowFixMe[incompatible-type] - invoke is not writable
+    // $FlowFixMe[cannot-write]
+    getInstanceRectangle.invoke = instancePtr => {
+      // $FlowFixMe[incompatible-type] - wrapPointer is not exposed
+      const instance: gdInitialInstance = gd.wrapPointer(
+        // $FlowFixMe[incompatible-type]
+        instancePtr,
+        gd.InitialInstance
+      );
+      if (!contentAABB) {
+        contentAABB = instanceMeasurer.getInstanceAABB(
+          instance,
+          new Rectangle()
+        );
+      } else {
+        contentAABB.union(
+          instanceMeasurer.getInstanceAABB(instance, new Rectangle())
+        );
+      }
+    };
+    // $FlowFixMe[incompatible-type] - JSFunctor is incompatible with Functor
+    initialInstances.iterateOverInstances(getInstanceRectangle);
+    getInstanceRectangle.delete();
+    return contentAABB;
+  };
+
+  zoomToFitContent = () => {
+    const contentAABB = this.getContentAABB();
+    if (contentAABB) this.fitViewToRectangle(contentAABB, { adaptZoom: true });
+  };
+
+  _getAreaRectangle = (): Rectangle => {
+    const { eventsBasedObjectVariant, project } = this.props;
+    return eventsBasedObjectVariant
+      ? new Rectangle(
+          eventsBasedObjectVariant.getAreaMinX(),
+          eventsBasedObjectVariant.getAreaMinY(),
+          eventsBasedObjectVariant.getAreaMaxX(),
+          eventsBasedObjectVariant.getAreaMaxY()
+        )
+      : new Rectangle(
+          0,
+          0,
+          project.getGameResolutionWidth(),
+          project.getGameResolutionHeight()
+        );
+  };
+
+  zoomToInitialPosition = () => {
+    const areaRectangle = this._getAreaRectangle();
+    this.setZoomFactor(
+      getRecommendedInitialZoomFactor(
+        Math.max(areaRectangle.width(), areaRectangle.height())
+      )
+    );
+    this.scrollTo(areaRectangle.centerX(), areaRectangle.centerY());
+  };
+
+  zoomToFitSelection = () => {
+    const selectedInstancesRectangle = this.selectedInstances.getSelectionAABB();
+    if (
+      selectedInstancesRectangle.width() > 0 &&
+      selectedInstancesRectangle.height() > 0
+    ) {
+      this.fitViewToRectangle(selectedInstancesRectangle, { adaptZoom: true });
+    }
+  };
+
+  centerViewOnLastInstance = (
+    instances: Array<gdInitialInstance>,
+    offset?: ?[number, number]
+  ) => {
+    if (instances.length === 0) return;
+
+    const instanceMeasurer = this.instancesRenderer.getInstanceMeasurer();
+    let lastInstanceRectangle = instanceMeasurer.getInstanceAABB(
+      instances[instances.length - 1],
+      new Rectangle()
+    );
+    this.fitViewToRectangle(lastInstanceRectangle, { adaptZoom: false });
+    if (offset) this.scrollBy(offset[0], offset[1]);
+  };
+
+  getLastContextMenuSceneCoordinates = (): any => {
+    return this.viewPosition.toSceneCoordinates(
+      this.lastContextMenuX,
+      this.lastContextMenuY
+    );
+  };
+
+  getLastCursorSceneCoordinates = (): [number, number] | null => {
+    if (this.lastCursorX === null || this.lastCursorY === null) return null;
+    return this.viewPosition.toSceneCoordinates(
+      this.lastCursorX,
+      this.lastCursorY
+    );
+  };
+
+  getCoordinatesToRenderTileMapPreview = (): any => {
+    const clickInterceptorPointerPathCoordinates = this.clickInterceptor.getPointerPathCoordinates();
+    if (clickInterceptorPointerPathCoordinates) {
+      return clickInterceptorPointerPathCoordinates;
+    }
+    const lastCursorSceneCoordinates = this.getLastCursorSceneCoordinates();
+    if (!lastCursorSceneCoordinates) return [];
+    return [
+      { x: lastCursorSceneCoordinates[0], y: lastCursorSceneCoordinates[1] },
+    ];
+  };
+
+  getViewPosition = (): ?ViewPosition => {
+    return this.viewPosition;
+  };
+
+  _renderScene = () => {
+    // Protect against rendering scheduled after the component is unmounted.
+    if (this._unmounted) return;
+    if (this._renderingPausedReasons.size > 0) return;
+
+    // Avoid killing the CPU by limiting the rendering calls.
+    try {
+      if (
+        this.fpsLimiter.shouldUpdate() &&
+        !shouldPreventRenderingInstanceEditors()
+      ) {
+        this.canvasCursor.render();
+        this.grid.render();
+        this.highlightedInstance.render();
+        this.hiddenInstancesDecorations.render();
+        this.tileMapPaintingPreview.render();
+        this.clickInterceptor.render();
+        this.selectedInstances.render();
+        this.selectionRectangle.render();
+        this.windowBorder.render();
+        this.windowMask.render();
+        this.statusBar.render();
+        this.profilerBar.render({
+          basicProfilingCounters: this.instancesRenderer.getBasicProfilingCounters(),
+          display: this.props.showBasicProfilingCounters,
+        });
+        this.background.render();
+
+        this.instancesRenderer.render(
+          this.pixiRenderer,
+          this.threeRenderer,
+          this.viewPosition,
+          this.uiPixiContainer,
+          this.backgroundPixiContainer
+        );
+      }
+
+      // Modify the content directly to avoid to trigger rendering
+      // and to avoid to send callbacks.
+      const { editorViewPosition2D } = this.props;
+      editorViewPosition2D.viewX = this.viewPosition.viewX;
+      editorViewPosition2D.viewY = this.viewPosition.viewY;
+
+      this.nextFrame = requestAnimationFrame(this._renderScene);
+    } catch (error) {
+      console.error('Exception caught while doing the rendering:', error);
+      this.setState({
+        renderingError: { error, uniqueErrorId: generateUUID() },
+      });
+    }
+  };
+
+  pauseSceneRendering = (reason: string) => {
+    if (this.nextFrame) cancelAnimationFrame(this.nextFrame);
+    this._renderingPausedReasons.add(reason);
+    // Deactivate interactions when the scene is paused.
+    // Useful when the scene is paused to reload textures. The event system
+    // might try to check if pointer is over a PIXI object using the texture
+    // of the object. If there is no texture, it will crash.
+    // The PIXI.EventSystem is not based on the PIXI.Ticker.
+    this.instancesRenderer.getPixiContainer().eventMode = 'none';
+
+    stopPIXITicker();
+  };
+
+  resumeSceneRendering = (reason: string) => {
+    this._renderingPausedReasons.delete(reason);
+    if (this._renderingPausedReasons.size > 0) {
+      console.info(
+        `Scene rendering is still paused (reasons: ${[
+          ...this._renderingPausedReasons,
+        ].join(', ')}) after reason "${reason}" is removed.`
+      );
+      return;
+    }
+
+    console.info(`Resuming scene rendering (last reason: ${reason}).`);
+    this._renderScene();
+    this.instancesRenderer.getPixiContainer().eventMode = 'auto';
+
+    startPIXITicker();
+  };
+
+  getInstanceSize = (
+    initialInstance: gdInitialInstance
+  ): [number, number, number] => {
+    return this.instancesRenderer
+      .getInstanceMeasurer()
+      .getUnrotatedInstanceSize(initialInstance);
+  };
+
+  render(): any {
+    if (!this.props.project) return null;
+
+    if (this.state.renderingError) {
+      return (
+        <ErrorFallbackComponent
+          error={this.state.renderingError.error}
+          componentTitle={<Trans>Instances editor rendering</Trans>}
+          componentStack="[InstancesEditor rendering]"
+          uniqueErrorId={this.state.renderingError.uniqueErrorId}
+        />
+      );
+    }
+
+    return (
+      <DropTarget
+        canDrop={() => true}
+        hover={monitor => {
+          this.fpsLimiter.notifyInteractionHappened();
+          const { _instancesAdder, viewPosition, canvasArea } = this;
+          if (!_instancesAdder || !canvasArea || !viewPosition) return;
+
+          const { x, y } = monitor.getClientOffset();
+          const canvasRect = canvasArea.getBoundingClientRect();
+          const pos = viewPosition.toSceneCoordinates(
+            x - canvasRect.left,
+            y - canvasRect.top
+          );
+          _instancesAdder.createOrUpdateTemporaryInstancesFromObjectNames(
+            pos,
+            this.props.selectedObjectNames,
+            this.props.chosenLayer
+          );
+        }}
+        drop={monitor => {
+          this.fpsLimiter.notifyInteractionHappened();
+
+          const { _instancesAdder, viewPosition, canvasArea } = this;
+          if (!_instancesAdder || !canvasArea || !viewPosition) return;
+
+          if (monitor.didDrop()) {
+            // Drop was done somewhere else (in a child of the canvas:
+            // should not happen, but still handling this case).
+            this._deleteTemporaryInstances();
+            return;
+          }
+
+          const { x, y } = monitor.getClientOffset();
+          const canvasRect = canvasArea.getBoundingClientRect();
+          const pos = viewPosition.toSceneCoordinates(
+            x - canvasRect.left,
+            y - canvasRect.top
+          );
+          const instances = _instancesAdder.updateTemporaryInstancePositions(
+            pos
+          );
+          _instancesAdder.commitTemporaryInstances();
+          this.props.onInstancesAdded(instances);
+        }}
+      >
+        {({ connectDropTarget, isOver }) => {
+          // The children are re-rendered when isOver change:
+          // take this opportunity to delete any temporary instances
+          // if the dragging is not done anymore over the canvas.
+          if (this._instancesAdder && !isOver) {
+            this._deleteTemporaryInstances();
+          }
+
+          return connectDropTarget(
+            <div
+              ref={canvasArea => (this.canvasArea = canvasArea)}
+              style={styles.canvasArea}
+              id={instancesEditorId}
+            />
+          );
+        }}
+      </DropTarget>
+    );
+  }
+}

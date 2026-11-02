@@ -1,0 +1,239 @@
+/*
+ * GDevelop Core
+ * Copyright 2008-present Florian Rival (Florian.Rival@gmail.com). All rights
+ * reserved. This project is released under the MIT License.
+ */
+#pragma once
+
+#include <vector>
+#include "GDCore/Project/EventsFunction.h"
+#include "GDCore/Project/FunctionFolderOrFunction.h"
+#include "GDCore/String.h"
+#include "GDCore/Tools/SerializableWithNameList.h"
+namespace gd {
+class SerializerElement;
+}
+
+namespace gd {
+
+/**
+ * \brief Used as a base class for classes that will own events-backed
+ * functions.
+ *
+ * \see gd::EventsFunctionContainer
+ * \ingroup PlatformDefinition
+ */
+class GD_CORE_API EventsFunctionsContainer
+    : private SerializableWithNameList<gd::EventsFunction> {
+public:
+  enum FunctionOwner {
+      Extension,
+      Object,
+      Behavior};
+
+  EventsFunctionsContainer(FunctionOwner source_) : owner(source_) {
+    // The properties folders are not copied.
+    // It's not an issue because the UI uses the serialization for duplication.
+    rootFolder = gd::make_unique<gd::FunctionFolderOrFunction>("__ROOT");
+  }
+
+  EventsFunctionsContainer(const EventsFunctionsContainer &other)
+      : owner(other.owner) {
+    Init(other);
+  }
+
+  EventsFunctionsContainer &operator=(const EventsFunctionsContainer &other) {
+    if (this != &other) {
+      owner = other.owner;
+      Init(other);
+    }
+
+    return *this;
+  }
+
+  /**
+   * \brief Get the source of the function container.
+   * 
+   * \note For instance, it can be useful to handle specific parameters for
+   * behaviors.
+   */
+  FunctionOwner GetOwner() const {
+    return owner;
+  }
+
+  /** \name Events Functions management
+   */
+  ///@{
+  /**
+   * \brief Check if the function with the specified name exists.
+   */
+  bool HasEventsFunctionNamed(const gd::String& name) const {
+    return Has(name);
+  }
+
+  /**
+   * \brief Get the function with the specified name.
+   *
+   * \warning Trying to access to a not existing function will result in
+   * undefined behavior.
+   */
+  gd::EventsFunction& GetEventsFunction(const gd::String& name) {
+    return Get(name);
+  }
+
+  /**
+   * \brief Get the function with the specified name.
+   *
+   * \warning Trying to access to a not existing function will result in
+   * undefined behavior.
+   */
+  const gd::EventsFunction& GetEventsFunction(const gd::String& name) const {
+    return Get(name);
+  }
+
+  /**
+   * \brief Get the function at the specified index in the list.
+   *
+   * \warning Trying to access to a not existing function will result in
+   * undefined behavior.
+   */
+  gd::EventsFunction& GetEventsFunction(std::size_t index) {
+    return Get(index);
+  }
+
+  /**
+   * \brief Get the function at the specified index in the list.
+   *
+   * \warning Trying to access to a not existing function will result in
+   * undefined behavior.
+   */
+  const gd::EventsFunction& GetEventsFunction(std::size_t index) const {
+    return Get(index);
+  }
+
+  /**
+   * \brief Return the number of functions.
+   */
+  std::size_t GetEventsFunctionsCount() const { return GetCount(); }
+
+  gd::EventsFunction &InsertNewEventsFunction(const gd::String &name,
+                                              std::size_t position) {
+    auto &newlyCreatedFunction = InsertNew(name, position);
+    rootFolder->InsertFunction(&newlyCreatedFunction);
+    return newlyCreatedFunction;
+  }
+
+  gd::EventsFunction &
+  InsertEventsFunction(const gd::EventsFunction &eventFunction,
+                       std::size_t position) {
+    auto &newlyCreatedFunction = Insert(eventFunction, position);
+    rootFolder->InsertFunction(&newlyCreatedFunction);
+    return newlyCreatedFunction;
+  }
+
+  void RemoveEventsFunction(const gd::String& name) {
+    rootFolder->RemoveRecursivelyFunctionNamed(name);
+    return Remove(name);
+  }
+  void ClearEventsFunctions() { return Clear(); }
+  void MoveEventsFunction(std::size_t oldIndex, std::size_t newIndex) {
+    return Move(oldIndex, newIndex);
+  };
+  std::size_t GetEventsFunctionPosition(const gd::EventsFunction& eventsFunction) {
+    return GetPosition(eventsFunction);
+  };
+
+  /**
+   * \brief Provide a raw access to the vector containing the functions.
+   */
+  const std::vector<std::unique_ptr<gd::EventsFunction>>& GetInternalVector()
+      const {
+    return elements;
+  };
+
+  /**
+   * \brief Provide a raw access to the vector containing the functions.
+   */
+  std::vector<std::unique_ptr<gd::EventsFunction>>& GetInternalVector() {
+    return elements;
+  };
+  ///@}
+
+  /** \name Folders management
+   */
+  ///@{
+  /**
+   * \brief Add a new empty function called \a name in the
+   * given folder at the specified position.<br>
+   *
+   * \return A reference to the function in the list.
+   */
+  gd::EventsFunction &InsertNewEventsFunctionInFolder(
+      const gd::String &name,
+      gd::FunctionFolderOrFunction &functionFolderOrFunction,
+      std::size_t position);
+
+  /**
+   * Returns a vector containing all object and folders in this container.
+   * Only use this for checking if you hold a valid `FunctionFolderOrFunction` -
+   * don't use this for rendering or anything else.
+   */
+  std::vector<const FunctionFolderOrFunction *>
+  GetAllFunctionFolderOrFunction() const;
+
+  gd::FunctionFolderOrFunction &GetRootFolder() { return *rootFolder; }
+
+  /**
+   * \brief Rebuild the folder structure from the function groups.
+   */
+  void ReinitializeFolderStructure();
+
+  void AddMissingFunctionsInRootFolder();
+
+  /**
+   * \brief Serialize folder structure.
+   */
+  void SerializeFoldersTo(SerializerElement &element) const;
+
+  /**
+   * \brief Unserialize folder structure.
+   */
+  void UnserializeFoldersFrom(const SerializerElement &element);
+  ///@}
+
+  /** \name Serialization
+   */
+  ///@{
+  /**
+   * \brief Serialize events functions.
+   */
+  void SerializeEventsFunctionsTo(SerializerElement& element) const {
+    return SerializeElementsTo("eventsFunction", element);
+  };
+
+  /**
+   * \brief Unserialize the events functions.
+   */
+  void UnserializeEventsFunctionsFrom(gd::Project& project,
+                                      const SerializerElement& element) {
+    return UnserializeElementsFrom("eventsFunction", project, element);
+  };
+  ///@}
+ protected:
+  /**
+   * Initialize object using another object. Used by copy-ctor and assign-op.
+   * Don't forget to update me if members were changed!
+   */
+  void Init(const gd::EventsFunctionsContainer& other) {
+    // The function folders are not copied.
+    // It's not an issue because the UI uses the serialization for duplication.
+    rootFolder = gd::make_unique<gd::FunctionFolderOrFunction>("__ROOT");
+    SerializableWithNameList<gd::EventsFunction>::Init(other);
+  };
+
+private:
+  FunctionOwner owner;
+  std::unique_ptr<gd::FunctionFolderOrFunction> rootFolder;
+};
+
+}  // namespace gd

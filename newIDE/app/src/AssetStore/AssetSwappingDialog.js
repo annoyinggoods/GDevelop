@@ -1,0 +1,203 @@
+// @flow
+import { t, Trans } from '@lingui/macro';
+import { I18n } from '@lingui/react';
+import * as React from 'react';
+import Dialog from '../UI/Dialog';
+import FlatButton from '../UI/FlatButton';
+import { AssetStore, type AssetStoreInterface } from '.';
+import { type ResourceManagementProps } from '../ResourcesList/ResourceSource';
+import ErrorBoundary from '../UI/ErrorBoundary';
+import LoaderModal from '../UI/LoaderModal';
+import { useInstallAsset } from './NewObjectDialog';
+import { swapAsset } from './AssetSwapper';
+import PixiResourcesLoader from '../ObjectsRendering/PixiResourcesLoader';
+import useAlertDialog from '../UI/Alert/useAlertDialog';
+import RaisedButton from '../UI/RaisedButton';
+import { AssetStoreNavigatorContext } from './AssetStoreNavigator';
+import {
+  sendAssetSwapFinished,
+  sendAssetSwapStart,
+} from '../Utils/Analytics/EventSender';
+
+type Props = {|
+  project: gdProject,
+  layout: ?gdLayout,
+  eventsBasedObject: gdEventsBasedObject | null,
+  objectsContainer: gdObjectsContainer,
+  object: gdObject,
+  resourceManagementProps: ResourceManagementProps,
+  onClose: ({ swappingDone: boolean }) => void,
+  onWillInstallExtension: (extensionNames: Array<string>) => void,
+  onExtensionInstalled: (extensionNames: Array<string>) => void,
+|};
+
+function AssetSwappingDialog({
+  project,
+  layout,
+  eventsBasedObject,
+  objectsContainer,
+  object,
+  resourceManagementProps,
+  onClose,
+  onWillInstallExtension,
+  onExtensionInstalled,
+}: Props) {
+  const shopNavigationState = React.useContext(AssetStoreNavigatorContext);
+  const { openedAssetShortHeader } = shopNavigationState.getCurrentPage();
+
+  const [
+    isAssetBeingInstalled,
+    setIsAssetBeingInstalled,
+  ] = React.useState<boolean>(false);
+  const installAsset = useInstallAsset({
+    project,
+    resourceManagementProps,
+    onWillInstallExtension,
+    onExtensionInstalled,
+  });
+  const { showAlert } = useAlertDialog();
+
+  React.useEffect(
+    () => {
+      sendAssetSwapStart({
+        originalObjectName: object.getName(),
+        objectType: object.getType(),
+      });
+    },
+    // Only run once on dialog open.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    []
+  );
+
+  const installOpenedAsset = React.useCallback(
+    async (): Promise<void> => {
+      if (!openedAssetShortHeader) return;
+
+      setIsAssetBeingInstalled(true);
+      try {
+        const installAssetOutput = await installAsset({
+          assetShortHeader: openedAssetShortHeader,
+          objectsContainer,
+          setIsAssetBeingInstalled: () => {},
+        });
+        if (!installAssetOutput) {
+          throw new Error('Failed to install asset');
+        }
+
+        const originalObjectName = object.getName();
+
+        if (installAssetOutput.createdObjects.length > 0) {
+          swapAsset(
+            project,
+            PixiResourcesLoader,
+            object,
+            installAssetOutput.createdObjects[0],
+            openedAssetShortHeader
+          );
+        }
+        for (const createdObject of installAssetOutput.createdObjects) {
+          objectsContainer.removeObject(createdObject.getName());
+        }
+
+        sendAssetSwapFinished({
+          originalObjectName,
+          newObjectName: object.getName(),
+          objectType: object.getType(),
+        });
+
+        onClose({ swappingDone: true });
+      } catch (err) {
+        showAlert({
+          title: t`Could not swap asset`,
+          message: t`Something went wrong while swapping the asset. Please try again.`,
+        });
+        console.error('Error while installing asset:', err);
+      } finally {
+        // Always go back to the previous page so the asset is unselected.
+        shopNavigationState.backToPreviousPage();
+        setIsAssetBeingInstalled(false);
+      }
+    },
+    [
+      installAsset,
+      project,
+      object,
+      objectsContainer,
+      openedAssetShortHeader,
+      onClose,
+      shopNavigationState,
+      showAlert,
+    ]
+  );
+
+  const mainAction = openedAssetShortHeader ? (
+    <RaisedButton
+      key="add-asset"
+      primary
+      label={
+        isAssetBeingInstalled ? <Trans>Adding...</Trans> : <Trans>Swap</Trans>
+      }
+      onClick={installOpenedAsset}
+      disabled={isAssetBeingInstalled}
+      id="swap-asset-button"
+    />
+  ) : null;
+
+  const assetStore = React.useRef<?AssetStoreInterface>(null);
+  const handleClose = React.useCallback(
+    () => {
+      assetStore.current && assetStore.current.onClose();
+      onClose({ swappingDone: false });
+    },
+    [onClose]
+  );
+
+  return (
+    <I18n>
+      {({ i18n }) => (
+        <>
+          <Dialog
+            title={<Trans>Swap {object.getName()} with another asset</Trans>}
+            actions={[mainAction]}
+            secondaryActions={[
+              <FlatButton
+                key="close"
+                label={<Trans>Back</Trans>}
+                onClick={handleClose}
+                id="close-button"
+                fullWidth
+                primary
+              />,
+            ]}
+            onApply={installOpenedAsset}
+            onRequestClose={handleClose}
+            open
+            flexBody
+            fullHeight
+            id="asset-swapping-dialog"
+            actionsFullWidthOnMobile
+          >
+            <AssetStore
+              ref={assetStore}
+              onlyShowAssets
+              assetSwappedObject={object}
+            />
+          </Dialog>
+          {isAssetBeingInstalled && <LoaderModal showImmediately />}
+        </>
+      )}
+    </I18n>
+  );
+}
+
+const AssetSwappingDialogWithErrorBoundary = (props: Props): React.Node => (
+  <ErrorBoundary
+    componentTitle={<Trans>Asset store dialog</Trans>}
+    scope="new-object-dialog"
+    onClose={() => props.onClose({ swappingDone: false })}
+  >
+    <AssetSwappingDialog {...props} />
+  </ErrorBoundary>
+);
+
+export default AssetSwappingDialogWithErrorBoundary;

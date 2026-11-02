@@ -1,0 +1,199 @@
+// @flow
+import * as React from 'react';
+import AuthenticatedUserContext from '../Profile/AuthenticatedUserContext';
+import { retryIfFailed } from '../Utils/RetryIfFailed';
+import { delay } from '../Utils/Delay';
+import { getBackedOffIntervalInMs } from '../Utils/UseAdaptivePollingInterval';
+import {
+  getAiGeneratedEvent,
+  createAiGeneratedEvent,
+} from '../Utils/GDevelopServices/Generation';
+
+import {
+  type EventsGenerationResult,
+  type EventBatch,
+} from '../EditorFunctions';
+import { type ToolScope } from '../EditorFunctions/Scope';
+import { makeSimplifiedProjectBuilder } from '../EditorFunctions/SimplifiedProject/SimplifiedProject';
+import { type FunctionAuthoringScope } from '../InstructionOrExpression/EnumeratedInstructionOrExpressionMetadata';
+import { prepareAiUserContent } from './PrepareAiUserContent';
+
+const gd: libGDevelop = global.gd;
+
+export const notLoggedInErrorMessage =
+  'Not logged in to GDevelop: this uses the GDevelop online services, ask the user to log in to their GDevelop account in the editor.';
+
+type UseGenerateEventsReturnType = {
+  generateEvents: ({
+    eventsDescription: string | null,
+    eventBatches: Array<EventBatch> | null,
+    existingEventsJson: string | null,
+    extensionNamesList: string,
+    objectsList: string,
+    placementHint: string | null,
+    relatedAiRequestId: string | null,
+    scope: ToolScope,
+    functionName: string | null,
+    sceneName: string,
+    estimatedComplexity: number | null,
+  }) => Promise<EventsGenerationResult>,
+};
+export const useGenerateEvents = ({
+  project,
+}: {|
+  project: ?gdProject,
+|}): UseGenerateEventsReturnType => {
+  const { profile, getAuthorizationHeader } = React.useContext(
+    AuthenticatedUserContext
+  );
+
+  const generateEvents = React.useCallback(
+    async ({
+      scope,
+      functionName,
+      sceneName,
+      eventsDescription,
+      eventBatches,
+      extensionNamesList,
+      objectsList,
+      existingEventsJson,
+      placementHint,
+      relatedAiRequestId,
+      estimatedComplexity,
+    }: {|
+      scope: ToolScope,
+      functionName: string | null,
+      sceneName: string,
+      eventsDescription: string | null,
+      eventBatches: Array<EventBatch> | null,
+      extensionNamesList: string,
+      objectsList: string,
+      existingEventsJson: string | null,
+      placementHint: string | null,
+      relatedAiRequestId: string | null,
+      estimatedComplexity: number | null,
+    |}): Promise<EventsGenerationResult> => {
+      if (!project) throw new Error('No project is opened.');
+      if (!profile) throw new Error(notLoggedInErrorMessage);
+
+      const simplifiedProjectBuilder = makeSimplifiedProjectBuilder(gd);
+      const simplifiedProjectJson = JSON.stringify(
+        simplifiedProjectBuilder.getSimplifiedProject(project, {})
+      );
+      // Events written inside a function of an extension can call the private
+      // members reachable from where this function is authored: describe them.
+      const authoringScope: FunctionAuthoringScope | null =
+        functionName && scope.extension_name
+          ? {
+              extensionName: scope.extension_name,
+              customBehaviorName: scope.custom_behavior_name || null,
+              customObjectName: scope.custom_object_name || null,
+            }
+          : null;
+      const projectSpecificExtensionsSummaryJson = JSON.stringify(
+        simplifiedProjectBuilder.getProjectSpecificExtensionsSummary(project, {
+          authoringScope,
+        })
+      );
+
+      try {
+        const preparedAiUserContent = await prepareAiUserContent({
+          getAuthorizationHeader,
+          userId: profile.id,
+          simplifiedProjectJson,
+          projectSpecificExtensionsSummaryJson,
+          eventsJson: existingEventsJson,
+        });
+
+        const createResult = await retryIfFailed(
+          { times: 3, backoff: { initialDelay: 200, factor: 2 } },
+          () =>
+            createAiGeneratedEvent(getAuthorizationHeader, {
+              userId: profile.id,
+              gameProjectJsonUserRelativeKey:
+                preparedAiUserContent.gameProjectJsonUserRelativeKey,
+              gameProjectJson: preparedAiUserContent.gameProjectJson,
+              projectSpecificExtensionsSummaryJsonUserRelativeKey:
+                preparedAiUserContent.projectSpecificExtensionsSummaryJsonUserRelativeKey,
+              projectSpecificExtensionsSummaryJson:
+                preparedAiUserContent.projectSpecificExtensionsSummaryJson,
+              existingEventsJsonUserRelativeKey:
+                preparedAiUserContent.eventsJsonUserRelativeKey,
+              existingEventsJson: preparedAiUserContent.eventsJson,
+              scope,
+              functionName,
+              sceneName,
+              eventsDescription,
+              eventBatches,
+              extensionNamesList,
+              objectsList,
+              placementHint,
+              relatedAiRequestId,
+              estimatedComplexity,
+            })
+        );
+
+        if (!createResult.creationSucceeded) {
+          return {
+            generationCompleted: false,
+            errorMessage: createResult.errorMessage,
+          };
+        }
+
+        // Poll with exponential backoff (fast initially, capped), bounded by a
+        // total time budget rather than a fixed attempt count.
+        const maxTotalWaitMs = 180000;
+        const maxPollIntervalMs = 5000;
+        const startTime = Date.now();
+        let pollIntervalMs = 1000;
+        let aiGeneratedEvent = createResult.aiGeneratedEvent;
+        while (aiGeneratedEvent.status === 'working') {
+          await delay(pollIntervalMs);
+
+          try {
+            aiGeneratedEvent = await getAiGeneratedEvent(
+              getAuthorizationHeader,
+              {
+                userId: profile.id,
+                aiGeneratedEventId: aiGeneratedEvent.id,
+              }
+            );
+          } catch (error) {
+            console.warn(
+              'Error while checking status of AI generated event - continuing...',
+              error
+            );
+          }
+          pollIntervalMs = getBackedOffIntervalInMs(
+            pollIntervalMs,
+            maxPollIntervalMs
+          );
+          if (Date.now() - startTime >= maxTotalWaitMs) {
+            return {
+              generationCompleted: false,
+              errorMessage:
+                'Event generation started but failed to complete in time.',
+            };
+          }
+        }
+
+        if (aiGeneratedEvent.status === 'suspended') {
+          return {
+            generationAborted: true,
+          };
+        }
+
+        return { generationCompleted: true, aiGeneratedEvent };
+      } catch (error) {
+        console.error('Error while launching events generation:', error);
+        return {
+          generationCompleted: false,
+          errorMessage: error.message,
+        };
+      }
+    },
+    [getAuthorizationHeader, project, profile]
+  );
+
+  return { generateEvents };
+};

@@ -1,0 +1,1331 @@
+/*
+ * GDevelop JS Platform
+ * Copyright 2013-2022 Florian Rival (Florian.Rival@gmail.com). All rights reserved.
+ * This project is released under the MIT License.
+ */
+namespace gdjs {
+  const logger = new gdjs.Logger('CustomRuntimeObject');
+
+  /**
+   * @category Objects > Custom Object
+   */
+  export type ObjectConfiguration = {
+    content: any;
+  };
+
+  /**
+   * @category Objects > Custom Object
+   */
+  export type CustomObjectConfiguration = ObjectConfiguration & {
+    animatable?: SpriteAnimationData[];
+    variant: string;
+    childrenContent?: { [objectName: string]: ObjectConfiguration & any };
+    isInnerAreaFollowingParentSize: boolean;
+  };
+
+  /**
+   * @category Objects > Custom Object
+   */
+  export type CustomObjectNetworkSyncDataType = {
+    anim?: SpriteAnimatorNetworkSyncData;
+    ifx: boolean;
+    ify: boolean;
+    sx: float;
+    sy: float;
+    op: float;
+    cc?: [float, float];
+  };
+
+  /**
+   * @category Objects > Custom Object
+   */
+  export type CustomObjectNetworkSyncData = ObjectNetworkSyncData &
+    CustomObjectNetworkSyncDataType;
+
+  /**
+   * An object that contains other object.
+   *
+   * This is the base class for objects generated from EventsBasedObject.
+   *
+   * @see gdjs.CustomRuntimeObjectInstanceContainer
+   * @category Objects > Custom Object
+   */
+  export abstract class CustomRuntimeObject
+    extends gdjs.RuntimeObject
+    implements
+      gdjs.Resizable,
+      gdjs.Scalable,
+      gdjs.Flippable,
+      gdjs.OpacityHandler
+  {
+    _renderer:
+      | gdjs.CustomRuntimeObject2DRenderer
+      | gdjs.CustomRuntimeObject3DRenderer;
+    /** It contains the children of this object. */
+    _instanceContainer: gdjs.CustomRuntimeObjectInstanceContainer;
+    _isUntransformedHitBoxesDirty: boolean = true;
+    /** It contains shallow copies of the children hitboxes */
+    private _untransformedHitBoxes: gdjs.Polygon[] = [];
+    /** The dimension of this object is calculated from its children AABBs. */
+    private _unrotatedAABB: AABB = { min: [0, 0], max: [0, 0] };
+    /**
+     * The bounds of the object content before any transformation.
+     * @see gdjs.CustomRuntimeObjectInstanceContainer._initialInnerArea
+     **/
+    protected _innerArea: {
+      min: [float, float, float];
+      max: [float, float, float];
+    } | null = null;
+    /**
+     * When the parent dimensions change:
+     * - if `false`, the object is stretch proportionally while children local
+     *   positions stay the same ({@link gdjs.CustomRuntimeObject._innerArea} don't change).
+     * - if `true`, the children local positions need to be adapted by events
+     *   to follow their parent size.
+     */
+    protected _isInnerAreaFollowingParentSize = false;
+    private _scaleX: float = 1;
+    private _scaleY: float = 1;
+    private _flippedX: boolean = false;
+    private _flippedY: boolean = false;
+    private opacity: float = 255;
+    private _customCenter: FloatPoint | null = null;
+    private _localTransformation: gdjs.AffineTransformation =
+      new gdjs.AffineTransformation();
+    /**
+     * Bumped by `invalidateTransformation` every time anything the
+     * transformation is built from changes. Each consumer keeps the revision
+     * it last used (the matrices below, the renderer its own dirty flag), so
+     * one of them reading the transformation never leaves another stale.
+     */
+    protected _transformationRevision: integer = 1;
+    private _computedTransformationRevision: integer = 0;
+    /**
+     * Where the local (0;0) lands, which is the translation the way back from
+     * the parent undoes. It is read far more often than it changes (the
+     * cursor is converted for every object under it, every frame), so it is
+     * kept from one read to the next.
+     */
+    private _inverseTranslationX: float = 0;
+    private _inverseTranslationY: float = 0;
+    private _computedInverseTransformationRevision: integer = 0;
+    /**
+     * The coefficients of the rotation of the object, computed once when the
+     * transformation is composed and used again to undo it: the two ways turn
+     * by exactly the same amounts, and the trigonometry is done once.
+     */
+    private _rotationCosine: float = 1;
+    private _rotationSine: float = 0;
+    private static _temporaryPoint: FloatPoint = [0, 0];
+    private static _temporaryCoefficients: FloatPoint = [0, 0];
+    _type: string;
+
+    /**
+     * @param parent The container the object belongs to
+     * @param objectData The object data used to initialize the object
+     */
+    constructor(
+      parent: gdjs.RuntimeInstanceContainer,
+      objectData: ObjectData & CustomObjectConfiguration,
+      instanceData: InstanceData | undefined
+    ) {
+      super(parent, objectData, instanceData);
+      this._type = objectData.type;
+      this._instanceContainer = new gdjs.CustomRuntimeObjectInstanceContainer(
+        parent,
+        this
+      );
+      this._renderer = this._createRender();
+
+      this._initializeFromObjectData(objectData);
+
+      if (parent.getGame().isInGameEdition()) {
+        // In the in-game editor, an error thrown by the events of the object
+        // is reported, and the editor goes on. The method is read at each
+        // call: the code of the object can be hot-reloaded.
+        for (const methodName of [
+          'onCreated',
+          'doStepPostEvents',
+          'onHotReloading',
+          'onDestroy',
+        ]) {
+          (this as any)[methodName] = (...args: any[]) => {
+            try {
+              return Object.getPrototypeOf(this)[methodName].apply(this, args);
+            } catch (error) {
+              parent.getGame().reportInGameEditorExtensionError(error, {
+                phase: methodName,
+                type: this._type,
+              });
+            }
+          };
+        }
+      }
+
+      // The generated code calls onCreated at the constructor end
+      // and onCreated calls its super implementation at its end.
+    }
+
+    private _initializeFromObjectData(
+      customObjectData: ObjectData & CustomObjectConfiguration
+    ) {
+      const eventsBasedObjectData = this._runtimeScene
+        .getGame()
+        .getEventsBasedObjectData(customObjectData.type);
+      if (!eventsBasedObjectData) {
+        logger.error(
+          `A CustomRuntimeObject was initialized (or re-initialized) from object data referring to an non existing events based object data with type "${customObjectData.type}".`
+        );
+        return;
+      }
+      const usedVariantData: EventsBasedObjectVariantData | null =
+        this.getRuntimeScene()
+          .getGame()
+          .getEventsBasedObjectVariantData(
+            customObjectData.type,
+            customObjectData.variant
+          );
+      if (!usedVariantData) {
+        // This can't actually happen.
+        logger.error(
+          `Unknown variant "${customObjectData.variant}" for object "${customObjectData.type}".`
+        );
+        return;
+      }
+
+      this._isInnerAreaFollowingParentSize =
+        eventsBasedObjectData.isInnerAreaFollowingParentSize;
+      if (usedVariantData.instances.length > 0) {
+        if (!this._innerArea) {
+          this._innerArea = {
+            min: [0, 0, 0],
+            max: [0, 0, 0],
+          };
+        }
+        this._innerArea.min[0] = usedVariantData.areaMinX;
+        this._innerArea.min[1] = usedVariantData.areaMinY;
+        this._innerArea.min[2] = usedVariantData.areaMinZ;
+        this._innerArea.max[0] = usedVariantData.areaMaxX;
+        this._innerArea.max[1] = usedVariantData.areaMaxY;
+        this._innerArea.max[2] = usedVariantData.areaMaxZ;
+        this.invalidateTransformation();
+      }
+      this._instanceContainer.loadFrom(customObjectData, usedVariantData);
+    }
+
+    protected abstract _createRender():
+      | gdjs.CustomRuntimeObject2DRenderer
+      | gdjs.CustomRuntimeObject3DRenderer;
+    protected abstract _reinitializeRenderer(): void;
+
+    override reinitialize(objectData: ObjectData & CustomObjectConfiguration) {
+      super.reinitialize(objectData);
+
+      this._reinitializeContentFromObjectData(objectData);
+
+      // When changing the variant, the instance is like a new instance.
+      // We call again `onCreated` at the end, like done by the constructor
+      // the first time it's created.
+      this.onCreated();
+    }
+
+    private _reinitializeContentFromObjectData(
+      objectData: ObjectData & CustomObjectConfiguration
+    ) {
+      this._reinitializeRenderer();
+      this._instanceContainer._unloadContent();
+      this._initializeFromObjectData(objectData);
+    }
+
+    override updateFromObjectData(
+      oldObjectData: ObjectData & CustomObjectConfiguration,
+      newObjectData: ObjectData & CustomObjectConfiguration
+    ): boolean {
+      const animator = this.getAnimator();
+      if (animator) {
+        animator.updateFromObjectData(
+          oldObjectData.animatable || [],
+          newObjectData.animatable || []
+        );
+      }
+      if (oldObjectData.variant !== newObjectData.variant) {
+        const width = this.getWidth();
+        const height = this.getHeight();
+        const hasInnerAreaChanged =
+          oldObjectData.isInnerAreaFollowingParentSize &&
+          this._instanceContainer._initialInnerArea &&
+          this._innerArea &&
+          (this._instanceContainer._initialInnerArea.min[0] !==
+            this._innerArea.min[0] ||
+            this._instanceContainer._initialInnerArea.min[1] !==
+              this._innerArea.min[1] ||
+            this._instanceContainer._initialInnerArea.max[0] !==
+              this._innerArea.max[0] ||
+            this._instanceContainer._initialInnerArea.max[1] !==
+              this._innerArea.max[1]);
+
+        this._reinitializeContentFromObjectData(newObjectData);
+
+        // The generated code calls the onCreated super implementation at the end.
+        this.onCreated();
+
+        // Keep the custom size
+        if (hasInnerAreaChanged) {
+          this.setWidth(width);
+          this.setHeight(height);
+        }
+      }
+      return true;
+    }
+
+    getNetworkSyncData(
+      syncOptions: GetNetworkSyncDataOptions
+    ): CustomObjectNetworkSyncData {
+      const animator = this.getAnimator();
+      const networkSyncData: CustomObjectNetworkSyncData = {
+        ...super.getNetworkSyncData(syncOptions),
+        ifx: this.isFlippedX(),
+        ify: this.isFlippedY(),
+        sx: this._scaleX,
+        sy: this._scaleY,
+        op: this.opacity,
+      };
+      if (animator) {
+        networkSyncData.anim = animator.getNetworkSyncData();
+      }
+      if (this._customCenter) {
+        networkSyncData.cc = this._customCenter;
+      }
+      return networkSyncData;
+    }
+
+    updateFromNetworkSyncData(
+      networkSyncData: CustomObjectNetworkSyncData,
+      options: UpdateFromNetworkSyncDataOptions
+    ) {
+      super.updateFromNetworkSyncData(networkSyncData, options);
+      if (networkSyncData.ifx !== undefined) {
+        this.flipX(networkSyncData.ifx);
+      }
+      if (networkSyncData.ify !== undefined) {
+        this.flipY(networkSyncData.ify);
+      }
+      if (networkSyncData.sx !== undefined) {
+        this.setScaleX(Math.abs(networkSyncData.sx));
+      }
+      if (networkSyncData.sy !== undefined) {
+        this.setScaleY(Math.abs(networkSyncData.sy));
+      }
+      if (networkSyncData.op !== undefined) {
+        this.setOpacity(networkSyncData.op);
+      }
+      if (networkSyncData.anim) {
+        const animator = this.getAnimator();
+        if (animator) {
+          animator.updateFromNetworkSyncData(networkSyncData.anim);
+        }
+      }
+      if (networkSyncData.cc) {
+        this.setRotationCenter(networkSyncData.cc[0], networkSyncData.cc[1]);
+      }
+      if (
+        networkSyncData.ifx !== undefined ||
+        networkSyncData.ify !== undefined ||
+        networkSyncData.sx !== undefined ||
+        networkSyncData.sy !== undefined ||
+        networkSyncData.anim !== undefined ||
+        networkSyncData.cc !== undefined
+      ) {
+        this.onChildrenLocationChanged();
+      }
+    }
+
+    override extraInitializationFromInitialInstance(
+      initialInstanceData: InstanceData
+    ) {
+      const animator = this.getAnimator();
+      if (initialInstanceData.numberProperties) {
+        for (
+          let i = 0, len = initialInstanceData.numberProperties.length;
+          i < len;
+          ++i
+        ) {
+          const extraData = initialInstanceData.numberProperties[i];
+          if (animator && extraData.name === 'animation') {
+            animator.setAnimationIndex(extraData.value);
+          }
+        }
+      }
+      if (initialInstanceData.customSize) {
+        this.setWidth(initialInstanceData.width);
+        this.setHeight(initialInstanceData.height);
+      }
+      this.setOpacity(
+        initialInstanceData.opacity === undefined
+          ? 255
+          : initialInstanceData.opacity
+      );
+      this.flipX(!!initialInstanceData.flippedX);
+      this.flipY(!!initialInstanceData.flippedY);
+    }
+
+    override onDeletedFromScene(): void {
+      // Let subclasses do something before the object is destroyed.
+      this.onDestroy(this._runtimeScene);
+      // Let behaviors do something before the object is destroyed.
+      super.onDeletedFromScene();
+      // Destroy the children.
+      this._instanceContainer.onDeletedFromScene(this._runtimeScene);
+    }
+
+    override onDestroyed(): void {
+      this._instanceContainer._destroy();
+      super.onDestroyed();
+    }
+
+    override update(parent: gdjs.RuntimeInstanceContainer): void {
+      this._instanceContainer._updateObjectsPreEvents();
+
+      this.doStepPreEvents(this._instanceContainer);
+
+      const profiler = this.getRuntimeScene().getProfiler();
+      if (profiler) {
+        profiler.begin(this.type);
+      }
+      // This is a bit like the "scene" events for custom objects.
+      this.doStepPostEvents(this._instanceContainer);
+      if (profiler) {
+        profiler.end(this.type);
+      }
+    }
+
+    override stepBehaviorsPostEvents(
+      instanceContainer: gdjs.RuntimeInstanceContainer
+    ): void {
+      super.stepBehaviorsPostEvents(instanceContainer);
+      this._instanceContainer._stepBehaviorsPostEvents();
+    }
+
+    /**
+     * This method is called when the preview is being hot-reloaded.
+     *
+     * Custom objects implement this method with code generated from events.
+     */
+    onHotReloading(parent: gdjs.RuntimeInstanceContainer) {}
+
+    // This is only to handle trigger once.
+    doStepPreEvents(parent: gdjs.RuntimeInstanceContainer) {}
+
+    /**
+     * This method is called each tick after events are done.
+     *
+     * Custom objects implement this method with code generated from events.
+     * @param parent The instanceContainer owning the object
+     */
+    doStepPostEvents(parent: gdjs.RuntimeInstanceContainer) {}
+
+    /**
+     * This method is called when the object is being removed from its parent
+     * container and is about to be destroyed/reused later.
+     *
+     * Custom objects implement this method with code generated from events.
+     */
+    onDestroy(parent: gdjs.RuntimeInstanceContainer) {}
+
+    override updatePreRender(parent: gdjs.RuntimeInstanceContainer): void {
+      this._instanceContainer._updateObjectsPreRender();
+      this.getRenderer().ensureUpToDate();
+    }
+
+    getRenderer():
+      | gdjs.CustomRuntimeObject2DRenderer
+      | gdjs.CustomRuntimeObject3DRenderer {
+      return this._renderer;
+    }
+
+    getChildrenContainer(): gdjs.RuntimeInstanceContainer {
+      return this._instanceContainer;
+    }
+
+    onChildrenLocationChanged() {
+      this._isUntransformedHitBoxesDirty = true;
+      if (this._isCenterOfRotationFollowingChildren()) {
+        // An object with no fixed area is as big as its children: they moved,
+        // so its center of rotation - and its transformation - moved with them.
+        this.invalidateTransformation();
+      } else {
+        // The object itself did not move: only what it contains did, which
+        // changes its hit boxes (and the ones of the objects containing it)
+        // but leaves its transformation as it was.
+        this.invalidateHitboxes();
+      }
+    }
+
+    /**
+     * Whether the center of rotation of the object - what its transformation
+     * and its renderer turn it around - is the middle of its children. An
+     * object given an area of its own (or a center of rotation) keeps it
+     * wherever its children go.
+     */
+    private _isCenterOfRotationFollowingChildren(): boolean {
+      return !this._customCenter && !this._innerArea;
+    }
+
+    override updateHitBoxes(): void {
+      if (this._isUntransformedHitBoxesDirty) {
+        this._updateUntransformedHitBoxes();
+      }
+
+      // Update the current hitboxes with the frame custom hit boxes
+      // and apply transformations.
+      const localTransformation = this.getLocalTransformation();
+      for (let i = 0; i < this._untransformedHitBoxes.length; ++i) {
+        if (i >= this.hitBoxes.length) {
+          this.hitBoxes.push(new gdjs.Polygon());
+        }
+        for (
+          let j = 0;
+          j < this._untransformedHitBoxes[i].vertices.length;
+          ++j
+        ) {
+          if (j >= this.hitBoxes[i].vertices.length) {
+            this.hitBoxes[i].vertices.push([0, 0]);
+          }
+          localTransformation.transform(
+            this._untransformedHitBoxes[i].vertices[j],
+            this.hitBoxes[i].vertices[j]
+          );
+        }
+        this.hitBoxes[i].vertices.length =
+          this._untransformedHitBoxes[i].vertices.length;
+      }
+    }
+
+    /**
+     * Merge the hitboxes of the children.
+     */
+    _updateUntransformedHitBoxes() {
+      this._isUntransformedHitBoxesDirty = false;
+
+      this._untransformedHitBoxes.length = 0;
+      let minX = Number.MAX_VALUE;
+      let minY = Number.MAX_VALUE;
+      let maxX = -Number.MAX_VALUE;
+      let maxY = -Number.MAX_VALUE;
+      for (const childInstance of this._instanceContainer.getAdhocListOfAllInstances()) {
+        if (!childInstance.isIncludedInParentCollisionMask()) {
+          continue;
+        }
+        Array.prototype.push.apply(
+          this._untransformedHitBoxes,
+          childInstance.getHitBoxes()
+        );
+        const childAABB = childInstance.getAABB();
+        minX = Math.min(minX, childAABB.min[0]);
+        minY = Math.min(minY, childAABB.min[1]);
+        maxX = Math.max(maxX, childAABB.max[0]);
+        maxY = Math.max(maxY, childAABB.max[1]);
+      }
+      if (minX === Number.MAX_VALUE) {
+        // The unscaled size can't be 0 because setWidth and setHeight wouldn't
+        // have any effect.
+        minX = 0;
+        minY = 0;
+        maxX = 1;
+        maxY = 1;
+      }
+      this._unrotatedAABB.min[0] = minX;
+      this._unrotatedAABB.min[1] = minY;
+      this._unrotatedAABB.max[0] = maxX;
+      this._unrotatedAABB.max[1] = maxY;
+
+      while (this.hitBoxes.length < this._untransformedHitBoxes.length) {
+        this.hitBoxes.push(new gdjs.Polygon());
+      }
+      this.hitBoxes.length = this._untransformedHitBoxes.length;
+    }
+
+    // Position:
+    /**
+     * Return an array containing the coordinates of the point passed as parameter
+     * in parent coordinate coordinates (as opposed to the object local coordinates).
+     *
+     * All transformations (flipping, scale, rotation) are supported.
+     *
+     * @param x The X position of the point, in object coordinates.
+     * @param y The Y position of the point, in object coordinates.
+     * @param destination Array that will be updated with the result
+     * (x and y position of the point in parent coordinates).
+     */
+    applyObjectTransformation(x: float, y: float, destination: FloatPoint) {
+      const source = destination;
+      source[0] = x;
+      source[1] = y;
+      this.getLocalTransformation().transform(source, destination);
+    }
+
+    /**
+     * Return the affine transformation that represents
+     * flipping, scale, rotation and translation of the object.
+     * @returns the affine transformation.
+     */
+    getLocalTransformation(): gdjs.AffineTransformation {
+      if (
+        this._computedTransformationRevision !== this._transformationRevision
+      ) {
+        this._updateLocalTransformation();
+      }
+      return this._localTransformation;
+    }
+
+    /**
+     * Everything the transformation of the object is built from (its position,
+     * its angle, its scales, its flips, its center of rotation and the area
+     * its children live in) changed: the matrices are recomputed on the next
+     * read, the hit boxes are invalidated and the renderer is told to update
+     * itself. Every mutator goes through this: a consumer forgotten here is a
+     * transformation read (or drawn) from values that no longer exist.
+     */
+    invalidateTransformation(): void {
+      this._invalidateTransformationWithoutRendererUpdate();
+      this.getRenderer().update();
+    }
+
+    /**
+     * Same as {@link gdjs.CustomRuntimeObject.invalidateTransformation}, for a
+     * mutator that tells the renderer what changed on its own (`updateX`,
+     * `updateY`, `updateAngle`): the renderer writes that one value on its
+     * container instead of building it again, and a build asked for earlier
+     * (a scale, a center of rotation...) is still pending.
+     */
+    private _invalidateTransformationWithoutRendererUpdate(): void {
+      this._transformationRevision++;
+      this.invalidateHitboxes();
+    }
+
+    /**
+     * Whether a position of the space containing this object has a place of
+     * its own inside it. A scale of 0 on X or Y collapses everything inside
+     * the object onto a line (or a point), and every position outside of it
+     * lands on that same line.
+     *
+     * Only X and Y: a position given to an object (the cursor, a touch) is a
+     * position of the plane containing it. A 3D custom object flattened by a
+     * scale of 0 on Z keeps its children where they are on that plane.
+     */
+    isTransformationInvertibleOnXAndY(): boolean {
+      return this._scaleX !== 0 && this._scaleY !== 0;
+    }
+
+    _updateLocalTransformation() {
+      const absScaleX = Math.abs(this._scaleX);
+      const absScaleY = Math.abs(this._scaleY);
+      const centerX = this.getUnscaledCenterX() * absScaleX;
+      const centerY = this.getUnscaledCenterY() * absScaleY;
+      const angleInRadians = (this.angle * Math.PI) / 180;
+
+      const coefficients = gdjs.CustomRuntimeObject._temporaryCoefficients;
+      gdjs.AffineTransformation.setRotationCoefficients(
+        angleInRadians,
+        coefficients
+      );
+      this._rotationCosine = coefficients[0];
+      this._rotationSine = coefficients[1];
+
+      this._localTransformation.setToTranslation(this.x, this.y);
+      this._localTransformation.rotateAroundWithCoefficients(
+        this._rotationCosine,
+        this._rotationSine,
+        centerX,
+        centerY
+      );
+      if (this._flippedX) {
+        this._localTransformation.flipX(centerX);
+      }
+      if (this._flippedY) {
+        this._localTransformation.flipY(centerY);
+      }
+      this._localTransformation.scale(absScaleX, absScaleY);
+
+      this._computedTransformationRevision = this._transformationRevision;
+    }
+
+    /**
+     * The X of a point of the inside of this object (the space its children
+     * live in), in the space containing this object - the scene when this
+     * object is in one, the custom object holding it otherwise. The boundary
+     * of one object is crossed: to reach the scene from a child of a child,
+     * convert again with the object containing this one.
+     *
+     * @param x The X position of the point, inside this object.
+     * @param y The Y position of the point, inside this object.
+     * @param z The Z position of the point, which a 2D custom object ignores
+     * (its children have no Z of their own). 3D custom objects override these
+     * conversions with their own transformation.
+     */
+    toParentX(x: float, y: float, z: float = 0): float {
+      const point = gdjs.CustomRuntimeObject._temporaryPoint;
+      this.applyObjectTransformation(x, y, point);
+      return point[0];
+    }
+
+    /** The Y of {@link gdjs.CustomRuntimeObject.toParentX}. */
+    toParentY(x: float, y: float, z: float = 0): float {
+      const point = gdjs.CustomRuntimeObject._temporaryPoint;
+      this.applyObjectTransformation(x, y, point);
+      return point[1];
+    }
+
+    /**
+     * The X of a point of the space containing this object, inside this object
+     * (the space its children live in): the other way round of
+     * {@link gdjs.CustomRuntimeObject.toParentX}.
+     *
+     * A scale of 0 collapsed the object: the point is then the closest one it
+     * can reach, with 0 on every collapsed axis (see
+     * {@link gdjs.CustomRuntimeObject.applyObjectInverseTransformation}).
+     *
+     * @param x The X position of the point, in the space containing this object.
+     * @param y The Y position of the point, in the space containing this object.
+     * @param z The Z position of the point, ignored by a 2D custom object.
+     */
+    fromParentX(x: float, y: float, z: float = 0): float {
+      const point = gdjs.CustomRuntimeObject._temporaryPoint;
+      this.applyObjectInverseTransformation(x, y, point);
+      return point[0];
+    }
+
+    /** The Y of {@link gdjs.CustomRuntimeObject.fromParentX}. */
+    fromParentY(x: float, y: float, z: float = 0): float {
+      const point = gdjs.CustomRuntimeObject._temporaryPoint;
+      this.applyObjectInverseTransformation(x, y, point);
+      return point[1];
+    }
+
+    /**
+     * The angle, in the space containing this object, of a direction given by
+     * its angle inside this object: where a child turned by `angle` faces,
+     * seen from outside. The angle of the object is added to it, its flips
+     * mirror it and scales of different values on X and Y bend it, like they
+     * do to the children drawn inside.
+     *
+     * Only for 2D custom objects: in 3D, an angle around Z is not the whole
+     * direction of a child (it can be pitched), so a direction is converted as
+     * two points.
+     *
+     * @param angle The angle of the direction inside this object, in degrees.
+     */
+    toParentAngle(angle: float): float {
+      return (
+        gdjs.CustomRuntimeObject._getFlippedAngle(
+          gdjs.CustomRuntimeObject._getScaledAngle(
+            angle,
+            this.getScaleX(),
+            this.getScaleY()
+          ),
+          this._flippedX,
+          this._flippedY
+        ) + this.angle
+      );
+    }
+
+    /**
+     * The angle, inside this object, of a direction given by its angle in the
+     * space containing it: the other way round of
+     * {@link gdjs.CustomRuntimeObject.toParentAngle}.
+     *
+     * @param angle The angle of the direction in the space containing this
+     * object, in degrees.
+     */
+    fromParentAngle(angle: float): float {
+      const scaleX = this.getScaleX();
+      const scaleY = this.getScaleY();
+      // A collapsed axis gives 0 to the direction on that axis, like it gives
+      // 0 to a point.
+      return gdjs.CustomRuntimeObject._getScaledAngle(
+        gdjs.CustomRuntimeObject._getUnflippedAngle(
+          angle - this.angle,
+          this._flippedX,
+          this._flippedY
+        ),
+        scaleX === 0 ? 0 : 1 / scaleX,
+        scaleY === 0 ? 0 : 1 / scaleY
+      );
+    }
+
+    /**
+     * A direction mirrored by flips: a flip on X turns an angle `a` into
+     * `180 - a`, a flip on Y into `-a`.
+     */
+    private static _getFlippedAngle(
+      angle: float,
+      isFlippedX: boolean,
+      isFlippedY: boolean
+    ): float {
+      const angleFlippedOnX = isFlippedX ? 180 - angle : angle;
+      return isFlippedY ? -angleFlippedOnX : angleFlippedOnX;
+    }
+
+    /**
+     * The other way round of
+     * {@link gdjs.CustomRuntimeObject._getFlippedAngle}, undoing the flips in
+     * the reverse order: a round trip gives back the same number, not only
+     * the same direction.
+     */
+    private static _getUnflippedAngle(
+      angle: float,
+      isFlippedX: boolean,
+      isFlippedY: boolean
+    ): float {
+      const angleUnflippedOnY = isFlippedY ? -angle : angle;
+      return isFlippedX ? 180 - angleUnflippedOnY : angleUnflippedOnY;
+    }
+
+    /**
+     * The angle of the direction `(cos(angle) * scaleX ; sin(angle) * scaleY)`,
+     * as close as possible to `angle` (they are the same with equal scales,
+     * without any rounding error). A direction collapsed to nothing (both
+     * scales of 0, or the direction along the only collapsed axis) keeps
+     * `angle`.
+     */
+    private static _getScaledAngle(
+      angle: float,
+      scaleX: float,
+      scaleY: float
+    ): float {
+      if (scaleX === scaleY && scaleX !== 0) {
+        return angle;
+      }
+      const angleInRadians = gdjs.toRad(angle);
+      const directionX = Math.cos(angleInRadians) * scaleX;
+      const directionY = Math.sin(angleInRadians) * scaleY;
+      return gdjs.CustomRuntimeObject._getAngleOfDirection(
+        directionX,
+        directionY,
+        angle
+      );
+    }
+
+    /**
+     * The angle of a direction, in degrees, chosen among the equivalent ones
+     * (one turn apart) as the closest to `nearAngle`: a conversion is
+     * continuous, and never gives -90 for a child turned by 270. A direction
+     * of no length has no angle: `nearAngle` is kept.
+     */
+    private static _getAngleOfDirection(
+      directionX: float,
+      directionY: float,
+      nearAngle: float
+    ): float {
+      if (directionX === 0 && directionY === 0) {
+        return nearAngle;
+      }
+      const angle = gdjs.toDegrees(Math.atan2(directionY, directionX));
+      return angle + 360 * Math.round((nearAngle - angle) / 360);
+    }
+
+    /**
+     * Return an array containing the coordinates of the point passed as parameter
+     * in object local coordinates (as opposed to the parent coordinate coordinates).
+     *
+     * All transformations (flipping, scale, rotation) are supported.
+     *
+     * @param x The X position of the point, in parent coordinates.
+     * @param y The Y position of the point, in parent coordinates.
+     * @param destination Array that will be updated with the result
+     * (x and y position of the point in object coordinates).
+     */
+    applyObjectInverseTransformation(
+      x: float,
+      y: float,
+      destination: FloatPoint
+    ) {
+      // The transformation of the object is `point -> M point + t`, where
+      // `M = rotation * flips * scales` and `t` is everything else (the center
+      // of rotation and the flip offsets included): `t` is where the local
+      // (0;0) lands. The rotation and the flips keep lengths, so they are
+      // always undone exactly; only a scale can collapse an axis, and the
+      // local coordinate of a collapsed axis is answered as 0 (every point of
+      // it has the same image: none of them is more the point than another).
+      if (
+        this._computedInverseTransformationRevision !==
+        this._transformationRevision
+      ) {
+        this._updateInverseTransformation();
+      }
+      const deltaX = x - this._inverseTranslationX;
+      const deltaY = y - this._inverseTranslationY;
+
+      const cos = this._rotationCosine;
+      const sin = this._rotationSine;
+      const rotatedX = cos * deltaX + sin * deltaY;
+      const rotatedY = cos * deltaY - sin * deltaX;
+      const unflippedX = this._flippedX ? -rotatedX : rotatedX;
+      const unflippedY = this._flippedY ? -rotatedY : rotatedY;
+      const absScaleX = Math.abs(this._scaleX);
+      const absScaleY = Math.abs(this._scaleY);
+      destination[0] = absScaleX === 0 ? 0 : unflippedX / absScaleX;
+      destination[1] = absScaleY === 0 ? 0 : unflippedY / absScaleY;
+    }
+
+    /**
+     * What {@link gdjs.CustomRuntimeObject.applyObjectInverseTransformation}
+     * undoes: where the local (0;0) lands, and the coefficients the rotation
+     * was built with. They are read from the transformation itself, so the two
+     * ways can never be built from different values.
+     */
+    private _updateInverseTransformation(): void {
+      const temporaryPoint = gdjs.CustomRuntimeObject._temporaryPoint;
+      temporaryPoint[0] = 0;
+      temporaryPoint[1] = 0;
+      // Composing the transformation is also what computes the coefficients
+      // of the rotation this undoes: a right angle gives exactly 0 and 1 on
+      // both ways, so a point on the edge of an object comes back exactly
+      // on it.
+      this.getLocalTransformation().transform(temporaryPoint, temporaryPoint);
+      this._inverseTranslationX = temporaryPoint[0];
+      this._inverseTranslationY = temporaryPoint[1];
+
+      this._computedInverseTransformationRevision =
+        this._transformationRevision;
+    }
+
+    override getDrawableX(): float {
+      const minX = this.getUnscaledMinX();
+      const absScaleX = this.getScaleX();
+      if (!this._flippedX) {
+        return this.x + minX * absScaleX;
+      } else {
+        return (
+          this.x +
+          (-minX - this.getUnscaledWidth() + 2 * this.getUnscaledCenterX()) *
+            absScaleX
+        );
+      }
+    }
+
+    private getUnscaledMinX(): float {
+      if (this._innerArea) {
+        return this._innerArea.min[0];
+      }
+      if (this._isUntransformedHitBoxesDirty) {
+        this._updateUntransformedHitBoxes();
+      }
+      return this._unrotatedAABB.min[0];
+    }
+
+    override getDrawableY(): float {
+      const minY = this.getUnscaledMinY();
+      const absScaleY = this.getScaleY();
+      if (!this._flippedY) {
+        return this.y + minY * absScaleY;
+      } else {
+        return (
+          this.y +
+          (-minY - this.getUnscaledHeight() + 2 * this.getUnscaledCenterY()) *
+            absScaleY
+        );
+      }
+    }
+
+    private getUnscaledMinY(): float {
+      if (this._innerArea) {
+        return this._innerArea.min[1];
+      }
+      if (this._isUntransformedHitBoxesDirty) {
+        this._updateUntransformedHitBoxes();
+      }
+      return this._unrotatedAABB.min[1];
+    }
+
+    /**
+     * @return the internal left bound of the object according to its children.
+     */
+    getInnerAreaMinX(): number {
+      if (this._innerArea) {
+        return this._innerArea.min[0];
+      }
+      if (this._isUntransformedHitBoxesDirty) {
+        this._updateUntransformedHitBoxes();
+      }
+      return this._unrotatedAABB.min[0];
+    }
+
+    /**
+     * @return the internal top bound of the object according to its children.
+     */
+    getInnerAreaMinY(): number {
+      if (this._innerArea) {
+        return this._innerArea.min[1];
+      }
+      if (this._isUntransformedHitBoxesDirty) {
+        this._updateUntransformedHitBoxes();
+      }
+      return this._unrotatedAABB.min[1];
+    }
+
+    /**
+     * @return the internal right bound of the object according to its children.
+     */
+    getInnerAreaMaxX(): number {
+      if (this._innerArea) {
+        return this._innerArea.max[0];
+      }
+      if (this._isUntransformedHitBoxesDirty) {
+        this._updateUntransformedHitBoxes();
+      }
+      return this._unrotatedAABB.max[0];
+    }
+
+    /**
+     * @return the internal bottom bound of the object according to its children.
+     */
+    getInnerAreaMaxY(): number {
+      if (this._innerArea) {
+        return this._innerArea.max[1];
+      }
+      if (this._isUntransformedHitBoxesDirty) {
+        this._updateUntransformedHitBoxes();
+      }
+      return this._unrotatedAABB.max[1];
+    }
+
+    getOriginalWidth(): float {
+      return (
+        this._instanceContainer.getInitialUnrotatedViewportMaxX() -
+        this._instanceContainer.getInitialUnrotatedViewportMinX()
+      );
+    }
+
+    getOriginalHeight(): float {
+      return (
+        this._instanceContainer.getInitialUnrotatedViewportMaxY() -
+        this._instanceContainer.getInitialUnrotatedViewportMinY()
+      );
+    }
+
+    /**
+     * @return the internal width of the object according to its children.
+     */
+    getUnscaledWidth(): float {
+      if (this._innerArea) {
+        return this._innerArea.max[0] - this._innerArea.min[0];
+      }
+      if (this._isUntransformedHitBoxesDirty) {
+        this._updateUntransformedHitBoxes();
+      }
+      return this._unrotatedAABB.max[0] - this._unrotatedAABB.min[0];
+    }
+
+    /**
+     * @return the internal height of the object according to its children.
+     */
+    getUnscaledHeight(): float {
+      if (this._innerArea) {
+        return this._innerArea.max[1] - this._innerArea.min[1];
+      }
+      if (this._isUntransformedHitBoxesDirty) {
+        this._updateUntransformedHitBoxes();
+      }
+      return this._unrotatedAABB.max[1] - this._unrotatedAABB.min[1];
+    }
+
+    /**
+     * @returns the center X from the local origin (0;0).
+     */
+    getUnscaledCenterX(): float {
+      if (this._customCenter) {
+        return this._customCenter[0];
+      }
+      return this.getUnscaledWidth() / 2 + this.getUnscaledMinX();
+    }
+
+    /**
+     * @returns the center Y from the local origin (0;0).
+     */
+    getUnscaledCenterY(): float {
+      if (this._customCenter) {
+        return this._customCenter[1];
+      }
+      return this.getUnscaledHeight() / 2 + this.getUnscaledMinY();
+    }
+
+    /**
+     * The center of rotation is defined relatively to the origin (the object
+     * position).
+     * This avoids the center to move when children push the bounds.
+     *
+     * When no custom center is defined, it will move
+     * to stay at the center of the children bounds.
+     *
+     * @param x coordinate of the custom center
+     * @param y coordinate of the custom center
+     */
+    setRotationCenter(x: float, y: float) {
+      if (!this._customCenter) {
+        this._customCenter = [0, 0];
+      }
+      this._customCenter[0] = x;
+      this._customCenter[1] = y;
+
+      this.invalidateTransformation();
+    }
+
+    hasCustomRotationCenter(): boolean {
+      return !!this._customCenter;
+    }
+
+    override getCenterX(): float {
+      return (
+        (this.getUnscaledCenterX() - this.getUnscaledMinX()) * this.getScaleX()
+      );
+    }
+
+    override getCenterY(): float {
+      return (
+        (this.getUnscaledCenterY() - this.getUnscaledMinY()) * this.getScaleY()
+      );
+    }
+
+    override getWidth(): float {
+      return this.getUnscaledWidth() * this.getScaleX();
+    }
+
+    override getHeight(): float {
+      return this.getUnscaledHeight() * this.getScaleY();
+    }
+
+    override setWidth(newWidth: float): void {
+      const unscaledWidth = this.getUnscaledWidth();
+      if (unscaledWidth === 0) {
+        return;
+      }
+      const scaleX = newWidth / unscaledWidth;
+      if (this._innerArea && this._isInnerAreaFollowingParentSize) {
+        this._innerArea.min[0] *= scaleX;
+        this._innerArea.max[0] *= scaleX;
+        this.invalidateTransformation();
+      } else {
+        this.setScaleX(scaleX);
+      }
+    }
+
+    override setHeight(newHeight: float): void {
+      const unscaledHeight = this.getUnscaledHeight();
+      if (unscaledHeight === 0) {
+        return;
+      }
+      const scaleY = newHeight / unscaledHeight;
+      if (this._innerArea && this._isInnerAreaFollowingParentSize) {
+        this._innerArea.min[1] *= scaleY;
+        this._innerArea.max[1] *= scaleY;
+        this.invalidateTransformation();
+      } else {
+        this.setScaleY(scaleY);
+      }
+    }
+
+    /**
+     * Change the size of the object.
+     *
+     * @param newWidth The new width of the object, in pixels.
+     * @param newHeight The new height of the object, in pixels.
+     */
+    setSize(newWidth: float, newHeight: float): void {
+      this.setWidth(newWidth);
+      this.setHeight(newHeight);
+    }
+
+    override setX(x: float): void {
+      if (x === this.x) {
+        return;
+      }
+      this.x = x;
+      this._invalidateTransformationWithoutRendererUpdate();
+      this.getRenderer().updateX();
+    }
+
+    override setY(y: float): void {
+      if (y === this.y) {
+        return;
+      }
+      this.y = y;
+      this._invalidateTransformationWithoutRendererUpdate();
+      this.getRenderer().updateY();
+    }
+
+    override setAngle(angle: float): void {
+      if (this.angle === angle) {
+        return;
+      }
+      this.angle = angle;
+      this._invalidateTransformationWithoutRendererUpdate();
+      this.getRenderer().updateAngle();
+    }
+
+    /**
+     * Change the scale on X and Y axis of the object.
+     *
+     * @param newScale The new scale (must be greater than 0).
+     */
+    setScale(newScale: float): void {
+      if (this._innerArea && this._isInnerAreaFollowingParentSize) {
+        // The scale is always 1;
+        return;
+      }
+      if (newScale < 0) {
+        newScale = 0;
+      }
+      if (
+        newScale === Math.abs(this._scaleX) &&
+        newScale === Math.abs(this._scaleY)
+      ) {
+        return;
+      }
+      this._scaleX = newScale * (this._flippedX ? -1 : 1);
+      this._scaleY = newScale * (this._flippedY ? -1 : 1);
+      this.invalidateTransformation();
+    }
+
+    /**
+     * Change the scale on X axis of the object (changing its width).
+     *
+     * @param newScale The new scale (must be greater than 0).
+     */
+    setScaleX(newScale: float): void {
+      if (this._innerArea && this._isInnerAreaFollowingParentSize) {
+        // The scale is always 1;
+        return;
+      }
+      if (newScale < 0) {
+        newScale = 0;
+      }
+      if (newScale === Math.abs(this._scaleX)) {
+        return;
+      }
+      this._scaleX = newScale * (this._flippedX ? -1 : 1);
+      this.invalidateTransformation();
+    }
+
+    /**
+     * Change the scale on Y axis of the object (changing its height).
+     *
+     * @param newScale The new scale (must be greater than 0).
+     */
+    setScaleY(newScale: float): void {
+      if (this._innerArea && this._isInnerAreaFollowingParentSize) {
+        // The scale is always 1;
+        return;
+      }
+      if (newScale < 0) {
+        newScale = 0;
+      }
+      if (newScale === Math.abs(this._scaleY)) {
+        return;
+      }
+      this._scaleY = newScale * (this._flippedY ? -1 : 1);
+      this.invalidateTransformation();
+    }
+
+    /**
+     * Get the scale of the object (or the arithmetic mean of the X and Y scale in case they are different).
+     *
+     * @return the scale of the object (or the arithmetic mean of the X and Y scale in case they are different).
+     * @deprecated Use `getScale` instead.
+     */
+    getScaleMean(): float {
+      return (Math.abs(this._scaleX) + Math.abs(this._scaleY)) / 2.0;
+    }
+
+    /**
+     * Get the scale of the object (or the geometric mean of the X and Y scale in case they are different).
+     *
+     * @return the scale of the object (or the geometric mean of the X and Y scale in case they are different).
+     */
+    getScale(): float {
+      const scaleX = Math.abs(this._scaleX);
+      const scaleY = Math.abs(this._scaleY);
+      return scaleX === scaleY ? scaleX : Math.sqrt(scaleX * scaleY);
+    }
+
+    /**
+     * Get the scale of the object on Y axis.
+     *
+     * @return the scale of the object on Y axis
+     */
+    getScaleY(): float {
+      return Math.abs(this._scaleY);
+    }
+
+    /**
+     * Get the scale of the object on X axis.
+     *
+     * @return the scale of the object on X axis
+     */
+    getScaleX(): float {
+      return Math.abs(this._scaleX);
+    }
+
+    // Visibility and display :
+
+    setOpacity(opacity: float): void {
+      if (opacity < 0) {
+        opacity = 0;
+      }
+      if (opacity > 255) {
+        opacity = 255;
+      }
+      this.opacity = opacity;
+      this.getRenderer().updateOpacity();
+    }
+
+    getOpacity(): number {
+      return this.opacity;
+    }
+
+    override hide(enable: boolean): void {
+      if (enable === undefined) {
+        enable = true;
+      }
+      this.hidden = enable;
+      this.getRenderer().updateVisibility();
+    }
+
+    flipX(enable: boolean) {
+      if (enable !== this._flippedX) {
+        this._scaleX *= -1;
+        this._flippedX = enable;
+        this.invalidateTransformation();
+      }
+    }
+
+    flipY(enable: boolean) {
+      if (enable !== this._flippedY) {
+        this._scaleY *= -1;
+        this._flippedY = enable;
+        this.invalidateTransformation();
+      }
+    }
+
+    isFlippedX(): boolean {
+      return this._flippedX;
+    }
+
+    isFlippedY(): boolean {
+      return this._flippedY;
+    }
+
+    /**
+     * Return the sprite animator.
+     *
+     * It returns `null` when custom objects don't have the Animatable capability.
+     */
+    getAnimator(): gdjs.SpriteAnimator<any> | null {
+      return null;
+    }
+  }
+
+  // Others initialization and internal state management :
+  // TODO EBO Activate and test instance recycling.
+  CustomRuntimeObject.supportsReinitialization = false;
+}

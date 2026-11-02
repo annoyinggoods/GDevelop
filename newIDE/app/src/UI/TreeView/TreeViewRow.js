@@ -1,0 +1,602 @@
+// @flow
+
+import * as React from 'react';
+import DropIndicator from '../SortableVirtualizedItemList/DropIndicator';
+import memoizeOne from 'memoize-one';
+import { areEqual } from 'react-window';
+import IconButton from '../IconButton';
+import ChevronArrowBottom from '../CustomSvgIcons/ChevronArrowBottom';
+import ChevronArrowRight from '../CustomSvgIcons/ChevronArrowRight';
+import Folder from '../CustomSvgIcons/Folder';
+import ListIcon from '../ListIcon';
+import useForceUpdate from '../../Utils/UseForceUpdate';
+import classes from './TreeView.module.css';
+import { shouldCloseOrCancel } from '../KeyboardShortcuts/InteractionKeys';
+import ThreeDotsMenu from '../CustomSvgIcons/ThreeDotsMenu';
+import { type ItemData, type ItemBaseAttributes, navigationKeys } from '.';
+import { useLongTouch } from '../../Utils/UseLongTouch';
+import { useDragDropManager } from 'react-dnd';
+import { dataObjectToProps } from '../../Utils/HTMLDataset';
+import { type DraggedItem } from '../DragAndDrop/DragSourceAndDropTarget';
+import { LONG_PRESS_DELAY_ON_HELD_ITEM } from '../DragAndDrop/TouchDragDelay';
+import HoldForMenuProgress from '../DragAndDrop/HoldForMenuProgress';
+import classNames from 'classnames';
+import { TreeViewRightPrimaryButton } from './TreeViewRightPrimaryButton';
+import InlineRenameInput from '../InlineRenameInput';
+
+const DELAY_BEFORE_OPENING_FOLDER_ON_DRAG_HOVER = 800;
+export const TREE_VIEW_ROW_HEIGHT = 32;
+const COLLAPSABLE_LINE_SIDE_DROP_ZONE_HEIGHT = 6;
+
+const onInputKeyDown = (event: KeyboardEvent) => {
+  if (navigationKeys.includes(event.key)) {
+    // Prevent navigating in the tree view when renaming an item.
+    event.stopPropagation();
+  } else if (shouldCloseOrCancel(event)) {
+    // Prevent closing dialog if TreeView is displayed in dialog.
+    event.stopPropagation();
+  }
+};
+
+// $FlowFixMe[missing-local-annot]
+const memoized = memoizeOne((initialValue, callback) => callback());
+
+type DragOverReporterProps = {|
+  isOver: boolean,
+  canDrop: boolean,
+  onChange: (isOver: boolean, canDrop: boolean) => void,
+|};
+
+/**
+ * Reports the drag over state of the row after rendering: it is only known
+ * in the render function of the drop target, where the row state can't be
+ * updated.
+ */
+const DragOverReporter = ({
+  isOver,
+  canDrop,
+  onChange,
+}: DragOverReporterProps): null => {
+  React.useEffect(
+    () => {
+      onChange(isOver, canDrop);
+    },
+    [isOver, canDrop, onChange]
+  );
+  return null;
+};
+
+type Props<Item> = {|
+  index: number,
+  style: any,
+  data: ItemData<Item>,
+  /** Used by react-window. */
+  isScrolling?: boolean,
+  /** True when the row is displayed as a sticky copy of an actual row. */
+  isSticky?: boolean,
+|};
+
+const TreeViewRow = <Item: ItemBaseAttributes>(
+  props: Props<Item>
+): React.Node => {
+  const { data, index, style, isSticky } = props;
+  const {
+    flattenedData,
+    onOpen,
+    onClick,
+    onSelect,
+    onBlurField,
+    onEndRenaming,
+    renamedItemId,
+    onContextMenu,
+    canDrop,
+    onDrop,
+    onEditItem,
+    isMobile,
+    DragSourceAndDropTarget,
+    getItemHtmlId,
+    forceDefaultDraggingPreview,
+    shouldSelectUponContextMenuOpening,
+  } = data;
+  const node = flattenedData[index];
+  // Slightly reduce the indentation on mobile, as horizontal space is scarce.
+  const left = node.depth * (isMobile ? 12 : 16);
+  const forceUpdate = useForceUpdate();
+  const isStayingOverRef = React.useRef<boolean>(false);
+  const openWhenOverTimeoutId = React.useRef<?TimeoutID>(null);
+  const [whereToDrop, setWhereToDrop] = React.useState<
+    'before' | 'after' | 'inside'
+  >('before');
+  const containerRef = React.useRef<?HTMLDivElement>(null);
+  // With mouse events, the browser fires a click when a drag ends on the row
+  // it started from (the item was dropped back in place). Such a click must
+  // not trigger the row action (opening the item...).
+  const hasDragJustEndedRef = React.useRef<boolean>(false);
+  const dragDropManager = useDragDropManager();
+  const openContextMenu = React.useCallback(
+    // $FlowFixMe[missing-local-annot]
+    ({ clientX, clientY }) => {
+      // When the context menu opens it intercepts subsequent touch events,
+      // so the drag backend never receives touchend/touchcancel and the drag
+      // stays active indefinitely. End it explicitly before opening the menu.
+      if (dragDropManager.getMonitor().isDragging()) {
+        dragDropManager.getActions().endDrag();
+      }
+      onContextMenu({
+        index: index,
+        item: node.item,
+        x: clientX,
+        y: clientY,
+      });
+    },
+    [dragDropManager, onContextMenu, index, node.item]
+  );
+
+  const { contextMenuProps: longTouchForContextMenuProps } = useLongTouch(
+    openContextMenu,
+    {
+      delay: LONG_PRESS_DELAY_ON_HELD_ITEM,
+    }
+  );
+
+  const onClickItem = React.useCallback(
+    // $FlowFixMe[missing-local-annot]
+    event => {
+      if (!node || node.item.isPlaceholder) return;
+      if (hasDragJustEndedRef.current) return;
+      if (node.item.isRoot) {
+        // A sticky root row does not collapse on click: the click reveals the
+        // actual row instead (handled by the sticky rows container).
+        if (!isSticky) onOpen(node);
+        return;
+      }
+      onSelect({
+        node,
+        exclusive: !(event.metaKey || event.ctrlKey || event.shiftKey),
+        extendFromAnchor: event.shiftKey,
+      });
+      onClick(node);
+    },
+    [onClick, onSelect, node, onOpen, isSticky]
+  );
+
+  const onDoubleClickItem = React.useCallback(
+    // $FlowFixMe[missing-local-annot]
+    e => {
+      if (!node || !node.hasChildren || node.disableCollapse) return;
+      onOpen(node);
+    },
+    [node, onOpen]
+  );
+
+  const selectAndOpenContextMenu = React.useCallback(
+    (event: MouseEvent) => {
+      // In multi-select mode, preserve an existing selection when right-clicking
+      // one of its rows. In single-select mode always (re-)select the row so
+      // that the context menu always operates on the correct item.
+      if (!node.item.isRoot && !(data.multiSelect && node.selected))
+        onClickItem(event);
+      openContextMenu(event);
+    },
+    [node, data.multiSelect, onClickItem, openContextMenu]
+  );
+
+  const setIsStayingOver = React.useCallback(
+    (active: boolean, canDrop: boolean) => {
+      // Do not open folder if cannot drop into it. It's implied that if it
+      // cannot be dropped in the folder, it cannot be dropped in any subfolders
+      // of the folder.
+      if (!canDrop && active) return;
+      if (active !== isStayingOverRef.current) {
+        isStayingOverRef.current = active;
+        forceUpdate();
+      }
+    },
+    [forceUpdate]
+  );
+
+  /**
+   * Effect that opens the node if the user is dragging another node and stays
+   * over the node.
+   */
+  React.useEffect(
+    () => {
+      if (
+        isStayingOverRef.current &&
+        !openWhenOverTimeoutId.current &&
+        node.canHaveChildren &&
+        node.collapsed
+      ) {
+        openWhenOverTimeoutId.current = setTimeout(() => {
+          onOpen(node);
+        }, DELAY_BEFORE_OPENING_FOLDER_ON_DRAG_HOVER);
+        return () => {
+          clearTimeout(openWhenOverTimeoutId.current);
+          openWhenOverTimeoutId.current = null;
+        };
+      }
+    },
+    // We want to have isStayingOverRef.current as dependency.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [onOpen, node, forceUpdate, isStayingOverRef.current]
+  );
+
+  const endRenaming = React.useCallback(
+    (newValue: string) => {
+      onEndRenaming(node.item, newValue);
+    },
+    [onEndRenaming, node.item]
+  );
+
+  const getContainerYPosition = React.useCallback(() => {
+    if (containerRef.current) {
+      return containerRef.current.getBoundingClientRect().top;
+    }
+  }, []);
+
+  const displayAsFolder = node.canHaveChildren;
+
+  // Create an empty pixel image once to override the default drag preview of all items.
+  const emptyImage = new Image();
+  emptyImage.src = 'data:image/gif;base64,R0lGODlhAQABAAD/ACwAAAAAAQABAAACADs=';
+
+  return (
+    <div style={style} ref={containerRef}>
+      <DragSourceAndDropTarget
+        beginDrag={() => {
+          if (!node.selected) onSelect({ node, exclusive: !node.selected });
+
+          if (forceDefaultDraggingPreview) {
+            return {};
+          }
+
+          // We return the item name and thumbnail to be used by the
+          // drag preview if this is not a folder.
+          // We can't use the item itself because it's not serializable.
+          if (typeof node.name === 'string' && !displayAsFolder) {
+            const draggedItem: DraggedItem = {
+              name: node.name,
+              thumbnail: node.thumbnailSrc || undefined,
+              is3D:
+                // $FlowFixMe[incompatible-type]
+                // $FlowFixMe[prop-missing]
+                !!node.item.content &&
+                !!node.item.content.is3D &&
+                // $FlowFixMe[incompatible-type]
+                node.item.content.is3D(),
+            };
+            return draggedItem;
+          }
+
+          // Otherwise, we let the default drag preview be displayed.
+          return {};
+        }}
+        canDrag={() =>
+          // Prevent dragging of sticky copies, root folder or placeholder.
+          !isSticky &&
+          !node.item.isRoot &&
+          !node.item.isPlaceholder &&
+          // Prevent dragging of item whose name is edited, allowing to select text with click and drag on text.
+          renamedItemId !== node.id
+        }
+        endDrag={() => {
+          hasDragJustEndedRef.current = true;
+        }}
+        canDrop={canDrop ? () => canDrop(node.item, whereToDrop) : () => true}
+        drop={() => {
+          onDrop(node.item, whereToDrop);
+        }}
+        hover={monitor => {
+          if (node.item.isRoot) {
+            if (whereToDrop !== 'inside') setWhereToDrop('inside');
+            return;
+          }
+          const { y } = monitor.getClientOffset();
+          // Use a cached version of container position to avoid recomputing bounding rectangle.
+          // Doing this, the position is computed every second the user hovers the target.
+          const containerYPosition = memoized(
+            Math.floor(Date.now() / 1000),
+            getContainerYPosition
+          );
+          if (containerYPosition) {
+            if (displayAsFolder) {
+              if (node.collapsed) {
+                setWhereToDrop(
+                  y - containerYPosition <=
+                    COLLAPSABLE_LINE_SIDE_DROP_ZONE_HEIGHT
+                    ? 'before'
+                    : y - containerYPosition <=
+                      TREE_VIEW_ROW_HEIGHT -
+                        COLLAPSABLE_LINE_SIDE_DROP_ZONE_HEIGHT
+                    ? 'inside'
+                    : 'after'
+                );
+              } else {
+                // If the folder is open, do not suggest to drop after as
+                // the drop indicator can be misleading (displayed under the row
+                // although dropping the element after would put it below the last
+                // displayed child of the folder).
+                setWhereToDrop(
+                  y - containerYPosition <=
+                    COLLAPSABLE_LINE_SIDE_DROP_ZONE_HEIGHT
+                    ? 'before'
+                    : 'inside'
+                );
+              }
+            } else {
+              setWhereToDrop(
+                y - containerYPosition <= TREE_VIEW_ROW_HEIGHT / 2
+                  ? 'before'
+                  : 'after'
+              );
+            }
+          }
+        }}
+      >
+        {({
+          connectDragSource,
+          connectDropTarget,
+          connectDragPreview,
+          isOver,
+          canDrop,
+          isReadyToDrag,
+        }) => {
+          const isRenaming = renamedItemId === node.id;
+
+          let itemRow = (
+            <div
+              className={classNames(classes.rowContentSide, {
+                [classes.rowContentSideLeft]: !node.item.isRoot,
+                [classes.rowContentExtraPadding]: !displayAsFolder,
+              })}
+            >
+              {displayAsFolder ? (
+                <>
+                  <IconButton
+                    size="small"
+                    onClick={e => {
+                      e.stopPropagation();
+                      onOpen(node);
+                    }}
+                    disabled={node.disableCollapse}
+                  >
+                    {node.collapsed ? (
+                      <ChevronArrowRight viewBox="2 2 12 12" fontSize="small" />
+                    ) : (
+                      <ChevronArrowBottom
+                        viewBox="2 2 12 12"
+                        fontSize="small"
+                      />
+                    )}
+                  </IconButton>
+                  {node.thumbnailSrc && node.thumbnailSrc !== 'FOLDER' ? (
+                    <div className={classes.thumbnail}>
+                      <ListIcon iconSize={20} src={node.thumbnailSrc} />
+                    </div>
+                  ) : (
+                    !node.item.isRoot && (
+                      <Folder className={classes.folderIcon} />
+                    )
+                  )}
+                </>
+              ) : node.thumbnailSrc ? (
+                <div className={classes.thumbnail}>
+                  <ListIcon iconSize={20} src={node.thumbnailSrc} />
+                </div>
+              ) : null}
+              {renamedItemId === node.id &&
+              !isSticky &&
+              typeof node.name === 'string' ? (
+                <InlineRenameInput
+                  initialValue={node.name}
+                  onEndRenaming={endRenaming}
+                  onBlur={onBlurField}
+                  onKeyDown={onInputKeyDown}
+                />
+              ) : (
+                <span
+                  className={classNames(
+                    classes.itemName,
+                    {
+                      [classes.rootFolder]: node.item.isRoot,
+                      [classes.placeholder]: node.item.isPlaceholder,
+                    },
+                    node.extraClass
+                  )}
+                >
+                  {node.name}
+                </span>
+              )}
+            </div>
+          );
+
+          // If this is an object, connect the drag preview with an empty image
+          // to override the default drag preview.
+          if (typeof node.name === 'string' && !displayAsFolder) {
+            connectDragPreview(emptyImage);
+          } else {
+            // If not (folder for instance), just use the item row as drag preview.
+            itemRow = connectDragPreview(itemRow);
+          }
+
+          const rightButtons = Array.isArray(node.rightButton)
+            ? node.rightButton
+            : node.rightButton
+            ? [node.rightButton]
+            : [];
+
+          const shouldDisplayMenu =
+            !node.shouldHideMenuIcon &&
+            !isMobile &&
+            (!node.item.isRoot || node.shouldHideMenuIcon !== null) &&
+            !node.item.isPlaceholder;
+
+          const dragSource = connectDragSource(
+            <div className={classes.fullSpaceContainer}>
+              {isOver && whereToDrop === 'before' && (
+                <DropIndicator canDrop={canDrop} />
+              )}
+              <div
+                className={classes.rowContent}
+                onDoubleClick={
+                  onEditItem ? () => onEditItem(node.item) : undefined
+                }
+                onContextMenu={
+                  isRenaming
+                    ? undefined
+                    : shouldSelectUponContextMenuOpening
+                    ? selectAndOpenContextMenu
+                    : openContextMenu
+                }
+                {...(isRenaming ? {} : longTouchForContextMenuProps)}
+              >
+                {itemRow}
+                {(node.rightComponent ||
+                  rightButtons.length > 0 ||
+                  shouldDisplayMenu) && (
+                  <div
+                    className={classNames(
+                      classes.rowContentSide,
+                      classes.rowContentSideRight
+                    )}
+                  >
+                    {node.rightComponent}
+                    {rightButtons.map((rightButton, rightButtonIndex) =>
+                      rightButton.primary ? (
+                        <TreeViewRightPrimaryButton
+                          id={rightButton.id}
+                          key={rightButtonIndex}
+                          onClick={e => {
+                            e.stopPropagation();
+                            if (rightButton.click) {
+                              rightButton.click();
+                            }
+                          }}
+                          label={
+                            rightButton.showPrimaryLabel
+                              ? rightButton.label
+                              : null
+                          }
+                          disabled={
+                            rightButton.enabled === undefined
+                              ? false
+                              : !rightButton.enabled
+                          }
+                          icon={rightButton.icon}
+                        />
+                      ) : (
+                        <IconButton
+                          id={rightButton.id}
+                          key={rightButtonIndex}
+                          size="small"
+                          onClick={e => {
+                            e.stopPropagation();
+                            if (rightButton.click) {
+                              rightButton.click();
+                            }
+                          }}
+                          tooltip={rightButton.label}
+                          disabled={
+                            rightButton.enabled === undefined
+                              ? false
+                              : !rightButton.enabled
+                          }
+                        >
+                          {rightButton.icon}
+                        </IconButton>
+                      )
+                    )}
+                    {shouldDisplayMenu && (
+                      <IconButton
+                        size="small"
+                        onClick={e => {
+                          e.stopPropagation();
+                          onContextMenu({
+                            item: node.item,
+                            index,
+                            x: e.clientX,
+                            y: e.clientY,
+                          });
+                        }}
+                      >
+                        <ThreeDotsMenu />
+                      </IconButton>
+                    )}
+                  </div>
+                )}
+              </div>
+              {isOver && whereToDrop === 'after' && (
+                <DropIndicator canDrop={canDrop} />
+              )}
+            </div>
+          );
+
+          const shouldDisplayDropIndicator =
+            isOver &&
+            whereToDrop === 'inside' &&
+            displayAsFolder &&
+            !node.item.isRoot;
+          const dropIndicatorClassName = shouldDisplayDropIndicator
+            ? canDrop
+              ? classes.withCanDropInsideIndicator
+              : classes.withCannotDropInsideIndicator
+            : null;
+
+          const dropTarget = connectDropTarget(
+            <div
+              id={
+                // Do not duplicate the id on the sticky copy of a row.
+                getItemHtmlId && !isSticky
+                  ? getItemHtmlId(node.item, index)
+                  : undefined
+              }
+              onMouseDown={() => {
+                hasDragJustEndedRef.current = false;
+              }}
+              onClick={onClickItem}
+              onDoubleClick={onDoubleClickItem}
+              className={classNames(
+                classes.rowContainer,
+                dropIndicatorClassName,
+                {
+                  [classes.selected]: node.selected,
+                  [classes.readyToDrag]: isReadyToDrag,
+                }
+              )}
+              aria-selected={node.selected}
+              aria-expanded={displayAsFolder ? !node.collapsed : false}
+              {...dataObjectToProps(node.dataset)}
+            >
+              {dragSource}
+              {isReadyToDrag && <HoldForMenuProgress />}
+            </div>
+          );
+
+          return (
+            <div
+              style={{ paddingLeft: left }}
+              className={classNames(classes.fullHeightFlexContainer, {
+                [classes.withDivider]:
+                  node.item.isRoot && index > 0 && !isSticky,
+              })}
+            >
+              {dropTarget}
+              <DragOverReporter
+                isOver={isOver}
+                canDrop={canDrop}
+                onChange={setIsStayingOver}
+              />
+            </div>
+          );
+        }}
+      </DragSourceAndDropTarget>
+    </div>
+  );
+};
+
+// $FlowFixMe[incompatible-type] - memo does not support having a generic in the props.
+// $FlowFixMe[missing-type-arg]
+export default (React.memo<Props>(
+  TreeViewRow,
+  areEqual
+): React.ComponentType<any>);

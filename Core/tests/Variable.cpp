@@ -1,0 +1,219 @@
+/*
+ * GDevelop Core
+ * Copyright 2008-2016 Florian Rival (Florian.Rival@gmail.com). All rights
+ * reserved. This project is released under the MIT License.
+ */
+/**
+ * @file Tests covering events of GDevelop Core.
+ */
+#include <algorithm>
+#include <initializer_list>
+#include <map>
+
+#include "GDCore/CommonTools.h"
+#include "GDCore/Project/VariablesContainer.h"
+#include "GDCore/Serialization/SerializerElement.h"
+#include "catch.hpp"
+
+TEST_CASE("Variable", "[common][variables]") {
+  SECTION("Basics") {
+    gd::Variable variable;
+    variable.SetValue(50);
+    REQUIRE(variable.GetValue() == 50);
+    REQUIRE(variable == 50);
+    REQUIRE(variable.GetType() == gd::Variable::Type::Number);
+
+    variable.SetString("MyString");
+    REQUIRE(variable.GetString() == "MyString");
+    REQUIRE(variable == "MyString");
+    REQUIRE(variable.GetType() == gd::Variable::Type::String);
+
+    variable.SetBool(false);
+    REQUIRE(variable.GetBool() == false);
+    REQUIRE(variable == false);
+    REQUIRE(variable.GetType() == gd::Variable::Type::Boolean);
+  }
+  SECTION("Conversions") {
+    gd::Variable variable;
+    variable.SetValue(50);
+    variable.CastTo(gd::Variable::Type::String);
+    REQUIRE(variable.GetType() == gd::Variable::Type::String);
+    REQUIRE(variable.GetString() == "50");
+
+    variable.SetString("MyString");
+    variable.CastTo(gd::Variable::Type::Number);
+    REQUIRE(variable.GetType() == gd::Variable::Type::Number);
+    REQUIRE(variable.GetValue() == 0);
+  }
+  SECTION("Use with int and string like semantics") {
+    gd::Variable variable;
+    variable = 50;
+    REQUIRE(variable.GetValue() == 50);
+    REQUIRE(variable.GetType() == gd::Variable::Type::Number);
+
+    variable = "MyString";
+    REQUIRE(variable.GetString() == "MyString");
+    REQUIRE(variable.GetType() == gd::Variable::Type::String);
+
+    variable = "MyRealStdString";
+    REQUIRE(variable.GetString() == "MyRealStdString");
+    REQUIRE(variable.GetType() == gd::Variable::Type::String);
+  }
+  SECTION("Copy and assignment") {
+    gd::Variable variable1;
+    gd::Variable variable2;
+
+    variable1.GetChild("Child1").SetString("Hello World");
+    variable1.GetChild("Child2").SetValue(42);
+
+    gd::Variable variable3(variable1);
+    variable2 = variable1;
+
+    REQUIRE(variable2.HasChild("Child1") == true);
+    REQUIRE(variable2.HasChild("Child2") == true);
+    REQUIRE(variable3.HasChild("Child1") == true);
+    REQUIRE(variable3.HasChild("Child2") == true);
+    REQUIRE(variable1.GetChild("Child1").GetString() == "Hello World");
+    REQUIRE(variable1.GetChild("Child2").GetValue() == 42);
+    REQUIRE(variable2.GetChild("Child1").GetString() == "Hello World");
+    REQUIRE(variable2.GetChild("Child2").GetValue() == 42);
+    REQUIRE(variable3.GetChild("Child1").GetString() == "Hello World");
+    REQUIRE(variable3.GetChild("Child2").GetValue() == 42);
+
+    variable2.GetChild("Child1").SetString("Hello copied World");
+    variable2.GetChild("Child2").SetValue(43);
+    variable3.GetChild("Child1").SetString("Hello second copied World");
+    variable3.GetChild("Child2").SetValue(44);
+    REQUIRE(variable1.GetChild("Child1").GetString() == "Hello World");
+    REQUIRE(variable1.GetChild("Child2").GetValue() == 42);
+    REQUIRE(variable2.GetChild("Child1").GetString() == "Hello copied World");
+    REQUIRE(variable2.GetChild("Child2").GetValue() == 43);
+    REQUIRE(variable3.GetChild("Child1").GetString() ==
+            "Hello second copied World");
+    REQUIRE(variable3.GetChild("Child2").GetValue() == 44);
+  }
+  SECTION("Can find identical number variables") {
+    gd::Variable variable;
+    variable.SetValue(123);
+
+    gd::Variable otherVariable;
+    otherVariable.SetValue(123);
+
+    REQUIRE(variable == otherVariable);
+  }
+  SECTION("Can find different number variables") {
+    gd::Variable variable;
+    variable.SetValue(123);
+
+    gd::Variable otherVariable;
+    otherVariable.SetValue(456);
+
+    REQUIRE(variable != otherVariable);
+  }
+  SECTION("Can find identical structure variables") {
+    gd::Variable variable;
+    variable.GetChild("MyChild").SetValue(123);
+
+    gd::Variable otherVariable;
+    otherVariable.GetChild("MyChild").SetValue(123);
+
+    REQUIRE(variable == otherVariable);
+  }
+  SECTION("Can find structure with different child value") {
+    gd::Variable variable;
+    variable.GetChild("MyChild").SetValue(123);
+
+    gd::Variable otherVariable;
+    otherVariable.GetChild("MyChild").SetValue(456);
+
+    REQUIRE(variable != otherVariable);
+  }
+  SECTION("Can find structure with different child name") {
+    gd::Variable variable;
+    variable.GetChild("MyChild").SetValue(123);
+
+    gd::Variable otherVariable;
+    otherVariable.GetChild("MyOtherChild").SetValue(123);
+
+    REQUIRE(variable != otherVariable);
+  }
+  SECTION("EnsurePersistentUuid sets missing UUIDs, recursively") {
+    gd::Variable variable;
+    variable.GetChild("MyChild").SetValue(123);
+    variable.GetChild("MyStructureChild").GetChild("MyGrandChild").SetValue(1);
+
+    REQUIRE(variable.GetPersistentUuid() == "");
+
+    variable.EnsurePersistentUuid();
+
+    REQUIRE(variable.GetPersistentUuid() != "");
+    REQUIRE(variable.GetChild("MyChild").GetPersistentUuid() != "");
+    REQUIRE(variable.GetChild("MyStructureChild")
+                .GetChild("MyGrandChild")
+                .GetPersistentUuid() != "");
+  }
+  SECTION("EnsurePersistentUuid preserves existing UUIDs") {
+    gd::Variable variable;
+    variable.GetChild("MyChild").SetValue(123);
+    variable.ResetPersistentUuid();
+
+    const gd::String uuid = variable.GetPersistentUuid();
+    const gd::String childUuid =
+        variable.GetChild("MyChild").GetPersistentUuid();
+    REQUIRE(uuid != "");
+    REQUIRE(childUuid != "");
+
+    // A new child, without a UUID, is added.
+    variable.GetChild("MyNewChild").SetValue(456);
+
+    variable.EnsurePersistentUuid();
+
+    REQUIRE(variable.GetPersistentUuid() == uuid);
+    REQUIRE(variable.GetChild("MyChild").GetPersistentUuid() == childUuid);
+    REQUIRE(variable.GetChild("MyNewChild").GetPersistentUuid() != "");
+  }
+  SECTION("Serialization keeps the editor-only \"mixed values\" marker") {
+    // The editor merges the variables of the objects of a group into a
+    // temporary container, marking the variables that don't have the same
+    // value (or type) on all objects as having "mixed values". This container
+    // is copied and snapshotted through serialization, so the marker must
+    // survive a serialization round trip - including for the variables that
+    // have no value and no children to read (a structure marked as having
+    // mixed values, as the marker clears its children, or a variable with
+    // entirely mixed types).
+    gd::Variable numberVariable;
+    numberVariable.SetValue(123);
+    numberVariable.MarkAsMixedValues();
+
+    gd::Variable structureVariable;
+    structureVariable.GetChild("MyChild").SetValue(456);
+    structureVariable.MarkAsMixedValues();
+
+    gd::Variable mixedTypesVariable;
+    mixedTypesVariable.CastTo(gd::Variable::Type::MixedTypes);
+
+    gd::SerializerElement element;
+    numberVariable.SerializeTo(element.AddChild("number"));
+    structureVariable.SerializeTo(element.AddChild("structure"));
+    mixedTypesVariable.SerializeTo(element.AddChild("mixedTypes"));
+
+    gd::Variable unserializedNumberVariable;
+    unserializedNumberVariable.UnserializeFrom(element.GetChild("number"));
+    REQUIRE(unserializedNumberVariable.GetType() == gd::Variable::Type::Number);
+    REQUIRE(unserializedNumberVariable.HasMixedValues());
+
+    gd::Variable unserializedStructureVariable;
+    unserializedStructureVariable.UnserializeFrom(
+        element.GetChild("structure"));
+    REQUIRE(unserializedStructureVariable.GetType() ==
+            gd::Variable::Type::Structure);
+    REQUIRE(unserializedStructureVariable.HasMixedValues());
+
+    gd::Variable unserializedMixedTypesVariable;
+    unserializedMixedTypesVariable.UnserializeFrom(
+        element.GetChild("mixedTypes"));
+    REQUIRE(unserializedMixedTypesVariable.GetType() ==
+            gd::Variable::Type::MixedTypes);
+    REQUIRE(unserializedMixedTypesVariable.HasMixedValues());
+  }
+}

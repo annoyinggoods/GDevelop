@@ -1,0 +1,132 @@
+{
+  "schema": 1,
+  "generatedFrom": "scripts/generate-byok-eventscript-examples.js (curated)",
+  "examples": [
+    {
+      "id": "collision-counter",
+      "name": "Collision -> variable increment (a score counter)",
+      "tags": [
+        "collision",
+        "variable",
+        "score",
+        "delete",
+        "pickup"
+      ],
+      "source": "if Collision(Player, Coin):\n  Delete(Coin)\n  SetNumberVariable(Score, =, Score + 1)"
+    },
+    {
+      "id": "timer-spawn",
+      "name": "Spawning on a timer, resetting it",
+      "tags": [
+        "timer",
+        "spawn",
+        "create",
+        "reset",
+        "random"
+      ],
+      "source": "if Timer(2, \"SpawnTimer\") and once:\n  Create(Rock, Random(800), -50, \"Base layer\")\n  ResetTimer(\"SpawnTimer\")"
+    },
+    {
+      "id": "scene-switch",
+      "name": "Switching to another scene (a menu)",
+      "tags": [
+        "scene",
+        "input",
+        "menu",
+        "key"
+      ],
+      "source": "if KeyPressed(\"Escape\") and once:\n  Scene(\"MainMenu\")"
+    },
+    {
+      "id": "movement-and-collision",
+      "name": "Frame-rate independent movement and a collision",
+      "tags": [
+        "movement",
+        "collision",
+        "time",
+        "delete"
+      ],
+      "source": "always:\n  SetX(Player, GetX(Player) + 250 * TimeDelta())\nif Collision(Player, Spike):\n  Delete(Player)"
+    },
+    {
+      "id": "trigger-once-shooting",
+      "name": "Trigger-once shooting",
+      "tags": [
+        "input",
+        "once",
+        "create",
+        "sound",
+        "shooting"
+      ],
+      "source": "if KeyPressed(\"Space\") and once:\n  Create(Bullet, GetX(Player), GetY(Player), \"Base layer\")\n  PlaySound(\"laser.wav\")"
+    },
+    {
+      "id": "else-chain",
+      "name": "Else chains over the scene state",
+      "tags": [
+        "else",
+        "variable",
+        "timer"
+      ],
+      "source": "if not DepartScene():\n  SetNumberVariable(Score, =, Score + 1)\nelse if DepartScene():\n  SetNumberVariable(Score, =, Score + 50)\n  ResetTimer(\"RoundTimer\")"
+    },
+    {
+      "id": "for-each-enemy",
+      "name": "For-each iteration over instances",
+      "tags": [
+        "loop",
+        "foreach",
+        "collision",
+        "variable",
+        "enemy"
+      ],
+      "source": "for each Enemy:\n  if Collision(Enemy, KillZone):\n    Delete(Enemy)\n    SetNumberVariable(Escaped, =, Escaped + 1)"
+    },
+    {
+      "id": "structure-children",
+      "name": "Iterating the children of a structure variable",
+      "tags": [
+        "structure",
+        "variable",
+        "foreach",
+        "save"
+      ],
+      "source": "for each child in SaveData value Items:\n  SetStringVariable(ItemName, =, Items)"
+    },
+    {
+      "id": "loops-groups-waves",
+      "name": "Loops, sub-events and a group",
+      "tags": [
+        "loop",
+        "repeat",
+        "group",
+        "timer",
+        "spawn",
+        "waves"
+      ],
+      "source": "group \"Waves\":\nrepeat 3 times:\n  if Timer(1, \"WaveTimer\") and once:\n    ResetTimer(\"WaveTimer\")\n    if not SceneVariableAsBoolean(BossAlive):\n      Create(Enemy, Random(800), 0, \"Base layer\")\n  always:\n    SetNumberVariable(WaveProgress, =, WaveProgress + 1)"
+    },
+    {
+      "id": "comments-anchors-disabled",
+      "name": "Comments, anchors, disabled events and links",
+      "tags": [
+        "comment",
+        "anchor",
+        "disabled",
+        "link"
+      ],
+      "source": "comment \"The setup below runs once at the start of the scene\"\nalways: # event-3.1\n  SetNumberVariable(Score, =, 0)\ndisabled always:\n  Wait(1)\nlink \"Shared enemy logic\""
+    },
+    {
+      "id": "animation-speed-boost",
+      "name": "Changing the animation on a pickup",
+      "tags": [
+        "animation",
+        "collision",
+        "once",
+        "sprite"
+      ],
+      "source": "if Collision(Player, SpeedBoost) and once:\n  Delete(SpeedBoost)\n  ChangeAnimationSpeedScale(Player, =, 2)"
+    }
+  ]
+}

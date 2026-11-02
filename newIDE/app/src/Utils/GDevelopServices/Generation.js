@@ -1,0 +1,1355 @@
+// @flow
+import { type ToolScope } from '../../EditorFunctions/Scope';
+import axios from 'axios';
+import { GDevelopAiCdn, GDevelopGenerationApi } from './ApiConfigs';
+import { type MessageByLocale } from '../i18n/MessageByLocale';
+import { getIDEVersionWithHash } from '../../Version';
+import { extractNextPageUriFromLinkHeader } from './Play';
+import {
+  ensureIsArray,
+  ensureIsObject,
+  ensureObjectHasProperty,
+} from '../DataValidator';
+
+export type Environment = 'staging' | 'live';
+
+export type GenerationStatus = 'working' | 'ready' | 'error' | 'suspended';
+
+export type AiRequestSuggestion = {
+  title: string,
+  suggestedMessage: string,
+};
+
+export type AiRequestSuggestions = {
+  explanationMessage: string,
+  suggestions: Array<AiRequestSuggestion>,
+};
+
+export type AiRequestPlanTask = {
+  id: string,
+  title: string,
+  description: string,
+  status: 'pending' | 'in_progress' | 'done' | 'voided',
+  dependsOn: string[],
+};
+
+export type AiRequestPlan = {
+  tasks: AiRequestPlanTask[],
+};
+
+export type AiRequestMessageAssistantFunctionCall = {|
+  type: 'function_call',
+  status: 'completed',
+  call_id: string,
+  name: string,
+  arguments: string,
+
+  taskId?: string,
+  subAgentAiRequestId?: string,
+|};
+
+export type AiRequestFunctionCallOutput = {
+  type: 'function_call_output',
+  call_id: string,
+  output: string,
+  suggestions?: AiRequestSuggestions,
+  messageId?: string,
+  projectVersionIdAfterMessage?: string,
+};
+
+export type AiRequestAssistantMessage = {
+  type: 'message',
+  status: 'completed',
+  role: 'assistant',
+  content: Array<
+    | {
+        type: 'reasoning',
+        status: 'completed',
+        summary: {
+          text: string,
+          type: 'summary_text',
+        },
+      }
+    | {
+        type: 'output_text',
+        status: 'completed',
+        text: string,
+        annotations: Array<{}>,
+      }
+    | AiRequestMessageAssistantFunctionCall
+  >,
+  suggestions?: AiRequestSuggestions,
+  messageId?: string,
+  projectVersionIdAfterMessage?: string,
+};
+
+export type AiRequestAttachment = {
+  attachmentId: string,
+  name: string,
+  mimeType: string,
+  size: number,
+  // How the AI reads the file: an image or a text (otherwise, only its name).
+  readableAs: 'image' | 'text' | null,
+};
+
+export type AiRequestUserMessage = {
+  type: 'message',
+  status: 'completed',
+  role: 'user',
+  content: Array<{
+    type: 'user_request',
+    status: 'completed',
+    text: string,
+  }>,
+  attachments?: Array<AiRequestAttachment>,
+  messageId?: string,
+  projectVersionIdBeforeMessage?: string,
+};
+
+export type AiRequestMessage =
+  | AiRequestAssistantMessage
+  | AiRequestUserMessage
+  | AiRequestFunctionCallOutput;
+
+export type AiConfiguration = {
+  presetId: string,
+};
+
+type AiRequestToolOptions = {
+  includeEventsJson?: boolean,
+  watchPollingIntervalInMs?: number,
+};
+
+/**
+ * Why an AI request failed, as reported by the API. The code is used to tell
+ * the user what happened and what they can do about it (see AiRequestErrorRow).
+ */
+export type AiRequestError = {
+  code: string,
+  message: string,
+};
+
+/**
+ * How much of the context (the "memory" of the conversation) an AI request
+ * uses, as estimated by the API.
+ */
+export type AiRequestContextStats = {
+  // Rough estimate of the tokens consumed by the conversation so far.
+  totalTokens: number,
+  // The share of the context budget used, from 0 to 1 (it can exceed 1 once
+  // the budget is passed, the AI is then asked to wrap up).
+  usedPercentage: number,
+};
+
+export type AiRequest = {
+  id: string,
+  // The name given by the user to the chat. Without one, the first user
+  // message stands for it.
+  title?: string | null,
+  // When the user archived the chat, hiding it from the active chats.
+  archivedAt?: string | null,
+  createdAt: string,
+  updatedAt: string,
+  userId: string,
+  gameId?: string | null,
+  gameProjectJson?: string | null,
+  status: GenerationStatus,
+  mode?: 'chat' | 'agent' | 'orchestrator',
+  aiConfiguration?: AiConfiguration,
+  toolsVersion?: string,
+  toolOptions?: AiRequestToolOptions | null,
+  forkedFromAiRequestId?: string | null,
+  forkedAfterOriginalMessageId?: string | null,
+  forkedAfterNewMessageId?: string | null,
+  parentAiRequestId?: string | null,
+
+  error: AiRequestError | null,
+  contextStats?: AiRequestContextStats | null,
+
+  // How many times the request was continued after a failure without making
+  // any progress in between, and the number of messages it had then: the API
+  // refuses to continue it again past MAX_AI_REQUEST_RETRIES_IN_A_ROW.
+  retriesInARowCount?: number,
+  retriedAfterMessagesCount?: number,
+
+  output?: Array<AiRequestMessage>,
+
+  lastUserMessagePriceInCredits?: number | null,
+  totalPriceInCredits?: number | null,
+};
+
+export type AiGeneratedEventStats = {
+  retriesCount: number,
+  finalMissingTypes: string[],
+  systemPromptTemplateHash: string,
+  userPromptTemplateHash: string,
+  allFeaturesSummaryContentHash: string,
+  finalModelPublicId: string,
+};
+
+export type AiGeneratedEventUndeclaredVariable = {
+  name: string,
+  type: 'number' | 'string' | 'boolean' | 'structure' | 'array' | null,
+  requiredScope: 'global' | 'scene' | 'none',
+};
+
+export type AiGeneratedEventMissingObjectBehavior = {
+  /** The name of the object that is missing the behavior. */
+  objectName: string,
+  /** The name of the behavior that is missing. */
+  name: string,
+  /** The type of the behavior that is missing. */
+  type: string,
+};
+
+export type AiGeneratedEventMissingResource = {
+  resourceName: string,
+  resourceKind:
+    | 'image'
+    | 'audio'
+    | 'font'
+    | 'video'
+    | 'json'
+    | 'tilemap'
+    | 'tileset'
+    | 'model3D'
+    | 'atlas'
+    | 'spine'
+    | 'spritesheet'
+    | 'bitmapFont'
+    | string,
+};
+
+export type AiGeneratedEventChange = {
+  operationName: string,
+  operationTargetEvent: string | null,
+  isEventsJsonValid: boolean | null,
+  generatedEvents: string | null,
+  areEventsValid: boolean | null,
+  extensionNames: string[] | null,
+  diagnosticLines: string[],
+  undeclaredVariables: AiGeneratedEventUndeclaredVariable[],
+  undeclaredObjectVariables: {
+    [objectName: string]: AiGeneratedEventUndeclaredVariable[],
+  },
+  missingObjectBehaviors: {
+    [objectName: string]: AiGeneratedEventMissingObjectBehavior[],
+  },
+  missingResources: AiGeneratedEventMissingResource[],
+};
+
+export type AiGeneratedEventBatch = {
+  eventsDescription: string,
+  eventScript: string | null,
+  placementRelation: string,
+  placementTargetEventId: string | null,
+  placementExpectedParentEventId: string | null,
+  placementRationale: string | null,
+  // Anchor echo for replace placements: the caller's copy of the current
+  // source of the event being replaced (proof it was read).
+  expectedEventSource: string | null,
+  // The actual current source of the target event (its own lines, without
+  // sub-events), computed by the editor, that the backend compares the
+  // anchor against.
+  placementTargetEventSource: string | null,
+  // `eventScript` was built by applying `edits` to the current source of the
+  // event: a compile error is always reported (never generated by the LLM).
+  isEventScriptFromEdits: boolean,
+};
+
+export type AiGeneratedEvent = {
+  id: string,
+  createdAt: string,
+  updatedAt: string,
+  userId: string | null, // null for calls made by the API.
+  status: GenerationStatus,
+
+  partialGameProjectJson: string,
+  eventsDescription: string | null,
+  eventBatches: Array<AiGeneratedEventBatch> | null,
+  extensionNamesList: string,
+  objectsList: string,
+  existingEventsJson: string | null,
+  existingEventsJsonUserRelativeKey: string | null,
+
+  resultMessage: string | null,
+  changes: Array<AiGeneratedEventChange> | null,
+
+  error: {
+    code: string,
+    message: string,
+  } | null,
+
+  stats: AiGeneratedEventStats | null,
+};
+
+export type AssetSearch = {
+  id: string,
+  userId: string,
+  createdAt: string,
+  query: {
+    searchTerms: string[],
+    objectType: string,
+    description: string | null,
+    twoDimensionalViewKind: string | null,
+    relatedAiRequestId: string | null,
+    lastUserMessage: string | null,
+    lastAssistantMessages: string[],
+  },
+  status: 'completed' | 'failed',
+  results: Array<{
+    score: number,
+    asset: any,
+  }> | null,
+};
+
+export type ResourceSearch = {
+  id: string,
+  userId: string,
+  createdAt: string,
+  query: {
+    searchTerms: string[],
+    resourceKind: string,
+  },
+  status: 'completed' | 'failed',
+  results: Array<{
+    score: number,
+    resource: {
+      name: string,
+      url: string,
+      tags?: Array<string>,
+      // Like the duration of an audio file, or the alphabets of a font.
+      metadata?: ?Object,
+    },
+  }> | null,
+};
+
+// $FlowFixMe[cannot-resolve-name]
+export const apiClient: Axios = axios.create({
+  baseURL: GDevelopGenerationApi.baseUrl,
+});
+
+export const getAiRequest = async (
+  getAuthorizationHeader: () => Promise<string>,
+  {
+    userId,
+    aiRequestId,
+    // When set, the backend only returns the messages from this one onward
+    // (see mergeIncrementalAiRequest in AiRequestContext).
+    outputFromMessageId,
+  }: {|
+    userId: string,
+    aiRequestId: string,
+    outputFromMessageId?: ?string,
+  |}
+): Promise<AiRequest> => {
+  const authorizationHeader = await getAuthorizationHeader();
+  // $FlowFixMe[underconstrained-implicit-instantiation]
+  const response = await axios.get(
+    `${GDevelopGenerationApi.baseUrl}/ai-request/${aiRequestId}`,
+    {
+      params: {
+        userId,
+        outputFromMessageId: outputFromMessageId || undefined,
+      },
+      headers: {
+        Authorization: authorizationHeader,
+      },
+    }
+  );
+  return ensureObjectHasProperty({
+    data: response.data,
+    propertyName: 'id',
+    endpointName: '/ai-request/{id} of Generation API',
+  });
+};
+
+/**
+ * Fetch the status of several AI requests at once (a parent request and all its
+ * active sub-agents). This collapses what used to be one status request per
+ * entity into a single request, without changing the polling cadence.
+ */
+export const getAiRequestStatuses = async (
+  getAuthorizationHeader: () => Promise<string>,
+  {
+    userId,
+    aiRequestIds,
+  }: {|
+    userId: string,
+    aiRequestIds: Array<string>,
+  |}
+): Promise<
+  Array<{| id: string, status: GenerationStatus, userId: ?string |}>
+> => {
+  if (aiRequestIds.length === 0) return [];
+
+  const authorizationHeader = await getAuthorizationHeader();
+  // $FlowFixMe[underconstrained-implicit-instantiation]
+  const response = await axios.get(
+    `${GDevelopGenerationApi.baseUrl}/ai-request`,
+    {
+      params: {
+        userId,
+        ids: aiRequestIds.join(','),
+        include: 'status',
+      },
+      headers: {
+        Authorization: authorizationHeader,
+      },
+    }
+  );
+  return ensureIsArray({
+    data: response.data,
+    endpointName: '/ai-request?ids=...&include=status of Generation API',
+  });
+};
+
+/**
+ * An AI request as the chat history lists it: enough to show and open it,
+ * without its conversation. Opening it loads the `AiRequest`.
+ */
+export type AiRequestSummary = {
+  id: string,
+  title: string | null,
+  archivedAt: string | null,
+  gameId: string | null,
+  createdAt: string,
+  updatedAt: string,
+  userId: string,
+  status: GenerationStatus,
+  mode?: 'chat' | 'agent' | 'orchestrator',
+  error: AiRequestError | null,
+  forkedFromAiRequestId: string | null,
+  parentAiRequestId: string | null,
+  totalPriceInCredits: number | null,
+  lastUserMessagePriceInCredits: number | null,
+  firstUserMessage: AiRequestUserMessage | null,
+  lastMessage: AiRequestMessage | null,
+  outputMessagesCount: number,
+};
+
+export const getAiRequestSummary = (aiRequest: AiRequest): AiRequestSummary => {
+  const output = aiRequest.output || [];
+  const firstMessage = output.length > 0 ? output[0] : null;
+  return {
+    id: aiRequest.id,
+    title: aiRequest.title || null,
+    archivedAt: aiRequest.archivedAt || null,
+    gameId: aiRequest.gameId || null,
+    createdAt: aiRequest.createdAt,
+    updatedAt: aiRequest.updatedAt,
+    userId: aiRequest.userId,
+    status: aiRequest.status,
+    mode: aiRequest.mode,
+    error: aiRequest.error,
+    forkedFromAiRequestId: aiRequest.forkedFromAiRequestId || null,
+    parentAiRequestId: aiRequest.parentAiRequestId || null,
+    totalPriceInCredits:
+      aiRequest.totalPriceInCredits !== undefined
+        ? aiRequest.totalPriceInCredits
+        : null,
+    lastUserMessagePriceInCredits:
+      aiRequest.lastUserMessagePriceInCredits !== undefined
+        ? aiRequest.lastUserMessagePriceInCredits
+        : null,
+    firstUserMessage:
+      firstMessage &&
+      firstMessage.type === 'message' &&
+      firstMessage.role === 'user'
+        ? firstMessage
+        : null,
+    lastMessage: output.length > 0 ? output[output.length - 1] : null,
+    outputMessagesCount: output.length,
+  };
+};
+
+/** Which chats to list: the active ones, the archived ones or all of them. */
+export type AiRequestSummariesFilter = 'active' | 'archived' | 'all';
+
+const archivedParameterByFilter = {
+  active: 'false',
+  archived: 'true',
+  all: 'any',
+};
+
+export const getAiRequestSummaries = async (
+  getAuthorizationHeader: () => Promise<string>,
+  {
+    userId,
+    forceUri,
+    filter,
+    gameId,
+  }: {|
+    userId: string,
+    // The URI of the page to fetch, which carries the filter and the game (or
+    // null for the first page).
+    forceUri: ?string,
+    filter: AiRequestSummariesFilter,
+    // Only the chats made on this game.
+    gameId?: ?string,
+  |}
+): Promise<{
+  aiRequestSummaries: Array<AiRequestSummary>,
+  nextPageUri: ?string,
+}> => {
+  const authorizationHeader = await getAuthorizationHeader();
+  const uri = forceUri || '/ai-request-summary';
+
+  // $FlowFixMe[incompatible-type]
+  const response = await apiClient.get(uri, {
+    headers: {
+      Authorization: authorizationHeader,
+    },
+    params: forceUri
+      ? { userId }
+      : {
+          userId,
+          perPage: 10,
+          archived: archivedParameterByFilter[filter],
+          gameId: gameId || undefined,
+        },
+  });
+  const nextPageUri = response.headers.link
+    ? extractNextPageUriFromLinkHeader(response.headers.link)
+    : null;
+  return {
+    aiRequestSummaries: ensureIsArray({
+      data: response.data,
+      endpointName: '/ai-request-summary of Generation API',
+    }),
+    nextPageUri,
+  };
+};
+
+export const createAiRequest = async (
+  getAuthorizationHeader: () => Promise<string>,
+  {
+    userId,
+    userRequest,
+    attachmentIds,
+    gameProjectJson,
+    gameProjectJsonUserRelativeKey,
+    projectSpecificExtensionsSummaryJson,
+    projectSpecificExtensionsSummaryJsonUserRelativeKey,
+    payWithCredits,
+    mode,
+    aiConfiguration,
+    gameId,
+    projectVersionIdBeforeMessage,
+    fileMetadata,
+    storageProviderName,
+    toolsVersion,
+  }: {|
+    userId: string,
+    userRequest: string,
+    attachmentIds: Array<string>,
+    gameProjectJson: string | null,
+    gameProjectJsonUserRelativeKey: string | null,
+    projectSpecificExtensionsSummaryJson: string | null,
+    projectSpecificExtensionsSummaryJsonUserRelativeKey: string | null,
+    payWithCredits: boolean,
+    mode: 'chat' | 'agent' | 'orchestrator',
+    aiConfiguration: AiConfiguration,
+    gameId: string | null,
+    projectVersionIdBeforeMessage?: string | null,
+    fileMetadata: ?{
+      fileIdentifier: string,
+      version?: string,
+      lastModifiedDate?: number,
+      gameId?: string,
+    },
+    storageProviderName: ?string,
+    toolsVersion: string,
+  |}
+): Promise<AiRequest> => {
+  const authorizationHeader = await getAuthorizationHeader();
+  const response = await apiClient.post(
+    '/ai-request',
+    {
+      gdevelopVersionWithHash: getIDEVersionWithHash(),
+      userRequest,
+      attachmentIds,
+      gameProjectJson,
+      gameProjectJsonUserRelativeKey,
+      projectSpecificExtensionsSummaryJson,
+      projectSpecificExtensionsSummaryJsonUserRelativeKey,
+      payWithCredits: !!payWithCredits,
+      payWithAiCredits: !payWithCredits,
+      mode,
+      aiConfiguration,
+      gameId,
+      projectVersionIdBeforeMessage,
+      fileMetadata,
+      storageProviderName,
+      toolsVersion,
+    },
+    {
+      params: {
+        userId,
+      },
+      headers: {
+        Authorization: authorizationHeader,
+      },
+    }
+  );
+  return ensureObjectHasProperty({
+    data: response.data,
+    propertyName: 'id',
+    endpointName: '/ai-request of Generation API',
+  });
+};
+
+export const addMessageToAiRequest = async (
+  getAuthorizationHeader: () => Promise<string>,
+  {
+    userId,
+    aiRequestId,
+    functionCallOutputs,
+    userMessage,
+    attachmentIds,
+    gameId,
+    projectVersionIdBeforeMessage,
+    payWithCredits,
+    gameProjectJson,
+    gameProjectJsonUserRelativeKey,
+    projectSpecificExtensionsSummaryJson,
+    projectSpecificExtensionsSummaryJsonUserRelativeKey,
+    paused,
+    mode,
+    toolsVersion,
+  }: {|
+    userId: string,
+    aiRequestId: string,
+    userMessage: string,
+    attachmentIds?: Array<string>,
+    gameId?: string,
+    projectVersionIdBeforeMessage?: string | null,
+    functionCallOutputs: Array<AiRequestFunctionCallOutput>,
+    payWithCredits: boolean,
+    gameProjectJson: string | null,
+    gameProjectJsonUserRelativeKey: string | null,
+    projectSpecificExtensionsSummaryJson: string | null,
+    projectSpecificExtensionsSummaryJsonUserRelativeKey: string | null,
+    paused?: boolean,
+    mode?: 'chat' | 'agent' | 'orchestrator',
+    toolsVersion?: string,
+  |}
+): Promise<AiRequest> => {
+  const authorizationHeader = await getAuthorizationHeader();
+  const response = await apiClient.post(
+    `/ai-request/${aiRequestId}/action/add-message`,
+    {
+      gdevelopVersionWithHash: getIDEVersionWithHash(),
+      functionCallOutputs,
+      userMessage,
+      attachmentIds,
+      gameId,
+      projectVersionIdBeforeMessage,
+      payWithCredits: !!payWithCredits,
+      payWithAiCredits: !payWithCredits,
+      gameProjectJson,
+      gameProjectJsonUserRelativeKey,
+      projectSpecificExtensionsSummaryJson,
+      projectSpecificExtensionsSummaryJsonUserRelativeKey,
+      paused,
+      mode,
+      toolsVersion,
+    },
+    {
+      params: {
+        userId,
+      },
+      headers: {
+        Authorization: authorizationHeader,
+      },
+    }
+  );
+  return ensureObjectHasProperty({
+    data: response.data,
+    propertyName: 'id',
+    endpointName: '/ai-request/{id}/action/add-message of Generation API',
+  });
+};
+
+/**
+ * Continue a failed AI request from where it stopped: nothing is added to the
+ * conversation, the AI picks up from the last message it managed to write.
+ */
+export const retryAiRequest = async (
+  getAuthorizationHeader: () => Promise<string>,
+  { userId, aiRequestId }: {| userId: string, aiRequestId: string |}
+): Promise<AiRequest> => {
+  const authorizationHeader = await getAuthorizationHeader();
+  const response = await apiClient.post(
+    `/ai-request/${aiRequestId}/action/retry`,
+    {},
+    { params: { userId }, headers: { Authorization: authorizationHeader } }
+  );
+  return ensureObjectHasProperty({
+    data: response.data,
+    propertyName: 'id',
+    endpointName: '/ai-request/{id}/action/retry of Generation API',
+  });
+};
+
+export const suspendAiRequest = async (
+  getAuthorizationHeader: () => Promise<string>,
+  { userId, aiRequestId }: {| userId: string, aiRequestId: string |}
+): Promise<AiRequest> => {
+  const authorizationHeader = await getAuthorizationHeader();
+  const response = await apiClient.post(
+    `/ai-request/${aiRequestId}/action/suspend`,
+    {},
+    { params: { userId }, headers: { Authorization: authorizationHeader } }
+  );
+  return ensureObjectHasProperty({
+    data: response.data,
+    propertyName: 'id',
+    endpointName: '/ai-request/{id}/action/suspend of Generation API',
+  });
+};
+
+/**
+ * Update what the user can set on an AI request: its title (`null` removes
+ * it, its first user message is then shown as its name) and whether it's
+ * archived.
+ */
+export const updateAiRequest = async (
+  getAuthorizationHeader: () => Promise<string>,
+  {
+    userId,
+    aiRequestId,
+    title,
+    archived,
+  }: {|
+    userId: string,
+    aiRequestId: string,
+    title?: string | null,
+    archived?: boolean,
+  |}
+): Promise<AiRequest> => {
+  const authorizationHeader = await getAuthorizationHeader();
+  const attributes: { title?: string | null, archived?: boolean } = {};
+  if (title !== undefined) attributes.title = title;
+  if (archived !== undefined) attributes.archived = archived;
+  const response = await apiClient.patch(
+    `/ai-request/${aiRequestId}`,
+    attributes,
+    { params: { userId }, headers: { Authorization: authorizationHeader } }
+  );
+  return ensureObjectHasProperty({
+    data: response.data,
+    propertyName: 'id',
+    endpointName: '/ai-request/{id} of Generation API',
+  });
+};
+
+export const deleteAiRequest = async (
+  getAuthorizationHeader: () => Promise<string>,
+  { userId, aiRequestId }: {| userId: string, aiRequestId: string |}
+): Promise<void> => {
+  const authorizationHeader = await getAuthorizationHeader();
+  await apiClient.delete(`/ai-request/${aiRequestId}`, {
+    params: { userId },
+    headers: { Authorization: authorizationHeader },
+  });
+};
+
+export const updateAiRequestMessage = async (
+  getAuthorizationHeader: () => Promise<string>,
+  {
+    userId,
+    aiRequestId,
+    aiRequestMessageId,
+    projectVersionIdBeforeMessage,
+    projectVersionIdAfterMessage,
+  }: {|
+    userId: string,
+    aiRequestId: string,
+    aiRequestMessageId: string,
+    projectVersionIdBeforeMessage?: ?string,
+    projectVersionIdAfterMessage?: ?string,
+  |}
+): Promise<void> => {
+  const authorizationHeader = await getAuthorizationHeader();
+  await apiClient.patch(
+    `/ai-request/${aiRequestId}/message/${aiRequestMessageId}`,
+    {
+      projectVersionIdBeforeMessage,
+      projectVersionIdAfterMessage,
+    },
+    {
+      params: {
+        userId,
+      },
+      headers: {
+        Authorization: authorizationHeader,
+      },
+    }
+  );
+};
+
+export const sendAiRequestFeedback = async (
+  getAuthorizationHeader: () => Promise<string>,
+  {
+    userId,
+    aiRequestId,
+    messageIndex,
+    feedback,
+    reason,
+    freeFormDetails,
+  }: {|
+    userId: string,
+    aiRequestId: string,
+    messageIndex: number,
+    feedback: 'like' | 'dislike',
+    reason?: string,
+    freeFormDetails?: string,
+  |}
+): Promise<AiRequest> => {
+  const authorizationHeader = await getAuthorizationHeader();
+  const response = await apiClient.post(
+    `/ai-request/${aiRequestId}/action/set-feedback`,
+    {
+      gdevelopVersionWithHash: getIDEVersionWithHash(),
+      messageIndex,
+      feedback,
+      reason,
+      freeFormDetails,
+    },
+    {
+      params: {
+        userId,
+      },
+      headers: {
+        Authorization: authorizationHeader,
+      },
+    }
+  );
+  return ensureObjectHasProperty({
+    data: response.data,
+    propertyName: 'id',
+    endpointName: '/ai-request/{id}/action/set-feedback of Generation API',
+  });
+};
+
+export const getAiRequestSuggestions = async (
+  getAuthorizationHeader: () => Promise<string>,
+  {
+    userId,
+    aiRequestId,
+    suggestionsType,
+    gameProjectJson,
+    gameProjectJsonUserRelativeKey,
+    projectSpecificExtensionsSummaryJson,
+    projectSpecificExtensionsSummaryJsonUserRelativeKey,
+  }: {|
+    userId: string,
+    aiRequestId: string,
+    suggestionsType: 'simple-list' | 'list-with-explanations',
+    gameProjectJson: string | null,
+    gameProjectJsonUserRelativeKey: string | null,
+    projectSpecificExtensionsSummaryJson: string | null,
+    projectSpecificExtensionsSummaryJsonUserRelativeKey: string | null,
+  |}
+): Promise<AiRequest> => {
+  const authorizationHeader = await getAuthorizationHeader();
+  const response = await apiClient.post(
+    `/ai-request/${aiRequestId}/action/get-suggestions`,
+    {
+      suggestionsType,
+      gdevelopVersionWithHash: getIDEVersionWithHash(),
+      gameProjectJson,
+      gameProjectJsonUserRelativeKey,
+      projectSpecificExtensionsSummaryJson,
+      projectSpecificExtensionsSummaryJsonUserRelativeKey,
+    },
+    {
+      params: {
+        userId,
+      },
+      headers: {
+        Authorization: authorizationHeader,
+      },
+    }
+  );
+  return ensureObjectHasProperty({
+    data: response.data,
+    propertyName: 'id',
+    endpointName: '/ai-request/{id}/action/get-suggestions of Generation API',
+  });
+};
+
+export type CreateAiGeneratedEventResult =
+  | {|
+      creationSucceeded: true,
+      aiGeneratedEvent: AiGeneratedEvent,
+    |}
+  | {|
+      creationSucceeded: false,
+      errorMessage: string,
+    |};
+
+export const createAiGeneratedEvent = async (
+  getAuthorizationHeader: () => Promise<string>,
+  {
+    userId,
+    gameProjectJson,
+    gameProjectJsonUserRelativeKey,
+    projectSpecificExtensionsSummaryJson,
+    projectSpecificExtensionsSummaryJsonUserRelativeKey,
+    scope,
+    functionName,
+    sceneName,
+    eventsDescription,
+    eventBatches,
+    extensionNamesList,
+    objectsList,
+    existingEventsJson,
+    existingEventsJsonUserRelativeKey,
+    placementHint,
+    relatedAiRequestId,
+    estimatedComplexity,
+  }: {|
+    userId: string,
+    gameProjectJson: string | null,
+    gameProjectJsonUserRelativeKey: string | null,
+    projectSpecificExtensionsSummaryJson: string | null,
+    projectSpecificExtensionsSummaryJsonUserRelativeKey: string | null,
+    // Where the events are generated (a scene, or a function of an extension
+    // with `functionName`); `sceneName` stays for the API.
+    scope: ToolScope,
+    functionName: string | null,
+    sceneName: string,
+    eventsDescription: string | null,
+    eventBatches: Array<AiGeneratedEventBatch> | null,
+    extensionNamesList: string,
+    objectsList: string,
+    existingEventsJson: string | null,
+    existingEventsJsonUserRelativeKey: string | null,
+    placementHint: string | null,
+    // Null for a request outside the GDevelop AI (the CLI, the MCP server):
+    // the events scripts are then only compiled, never handed to an agent.
+    relatedAiRequestId: string | null,
+    estimatedComplexity: number | null,
+  |}
+): Promise<CreateAiGeneratedEventResult> => {
+  const authorizationHeader = await getAuthorizationHeader();
+  const response = await apiClient.post(
+    `/ai-generated-event`,
+    {
+      gdevelopVersionWithHash: getIDEVersionWithHash(),
+      gameProjectJson,
+      gameProjectJsonUserRelativeKey,
+      projectSpecificExtensionsSummaryJson,
+      projectSpecificExtensionsSummaryJsonUserRelativeKey,
+      scope,
+      functionName,
+      sceneName,
+      eventsDescription,
+      eventBatches,
+      extensionNamesList,
+      objectsList,
+      existingEventsJson,
+      existingEventsJsonUserRelativeKey,
+      placementHint,
+      relatedAiRequestId,
+      estimatedComplexity,
+    },
+    {
+      params: {
+        userId,
+      },
+      headers: {
+        Authorization: authorizationHeader,
+      },
+      validateStatus: status => true,
+    }
+  );
+
+  if (response.status === 200) {
+    const data = ensureObjectHasProperty({
+      data: response.data,
+      propertyName: 'id',
+      endpointName: '/ai-generated-event of Generation API',
+    });
+    return {
+      creationSucceeded: true,
+      aiGeneratedEvent: data,
+    };
+  } else if (response.status === 400) {
+    // Report the failure to give a chance to the caller to save this message
+    // and retry the generation in a different way.
+    return {
+      creationSucceeded: false,
+      errorMessage: JSON.stringify(response.data),
+    };
+  }
+
+  // Unexpected error: throw an exception as this can be something like a network error
+  // or a server error.
+  throw new Error(
+    `Error while running AI event generation: ${response.statusText}`
+  );
+};
+
+export const getAiGeneratedEvent = async (
+  getAuthorizationHeader: () => Promise<string>,
+  {
+    userId,
+    aiGeneratedEventId,
+  }: {|
+    userId: string,
+    aiGeneratedEventId: string,
+  |}
+): Promise<AiGeneratedEvent> => {
+  const authorizationHeader = await getAuthorizationHeader();
+  const response = await apiClient.get(
+    `/ai-generated-event/${aiGeneratedEventId}`,
+    {
+      params: {
+        userId,
+      },
+      headers: {
+        Authorization: authorizationHeader,
+      },
+    }
+  );
+  return ensureObjectHasProperty({
+    data: response.data,
+    propertyName: 'id',
+    endpointName: '/ai-generated-event/{id} of Generation API',
+  });
+};
+
+export const createAssetSearch = async (
+  getAuthorizationHeader: () => Promise<string>,
+  {
+    userId,
+    searchTerms,
+    description,
+    objectType,
+    twoDimensionalViewKind,
+    exactOrPartialAssetId,
+    relatedAiRequestId,
+    lastUserMessage,
+    lastAssistantMessages,
+  }: {|
+    userId: string,
+    searchTerms: string,
+    description: string,
+    objectType: string | null,
+    twoDimensionalViewKind: string,
+    exactOrPartialAssetId?: string | null,
+    relatedAiRequestId?: string | null,
+    lastUserMessage?: string | null,
+    lastAssistantMessages?: string[],
+  |}
+): Promise<AssetSearch> => {
+  const authorizationHeader = await getAuthorizationHeader();
+  const response = await apiClient.post(
+    `/asset-search`,
+    {
+      gdevelopVersionWithHash: getIDEVersionWithHash(),
+      searchTerms,
+      description,
+      objectType,
+      twoDimensionalViewKind,
+      exactOrPartialAssetId,
+      relatedAiRequestId,
+      lastUserMessage,
+      lastAssistantMessages,
+    },
+    {
+      params: {
+        userId,
+      },
+      headers: {
+        Authorization: authorizationHeader,
+      },
+    }
+  );
+  return ensureObjectHasProperty({
+    data: response.data,
+    propertyName: 'id',
+    endpointName: '/asset-search of Generation API',
+  });
+};
+
+export const createResourceSearch = async (
+  getAuthorizationHeader: () => Promise<string>,
+  {
+    userId,
+    searchTerms,
+    resourceKind,
+  }: {|
+    userId: string,
+    searchTerms: string,
+    resourceKind: string,
+  |}
+): Promise<ResourceSearch> => {
+  const authorizationHeader = await getAuthorizationHeader();
+  const response = await apiClient.post(
+    `/resource-search`,
+    {
+      gdevelopVersionWithHash: getIDEVersionWithHash(),
+      searchTerms,
+      resourceKind,
+    },
+    {
+      params: {
+        userId,
+      },
+      headers: {
+        Authorization: authorizationHeader,
+      },
+    }
+  );
+  return ensureObjectHasProperty({
+    data: response.data,
+    propertyName: 'id',
+    endpointName: '/resource-search of Generation API',
+  });
+};
+
+// The output of a function of the GDevelop AI reading the docs or searching
+// the stores: `success`, an optional `message` and the found content, given
+// as is to the agent.
+export type LookupToolCall = {|
+  name: string,
+  output: { success: boolean, message?: string, [string]: any },
+|};
+
+export const createLookupToolCall = async (
+  getAuthorizationHeader: () => Promise<string>,
+  {
+    userId,
+    name,
+    args,
+    toolsVersion,
+    projectSpecificExtensionsSummaryJson,
+    projectSpecificExtensionsSummaryJsonUserRelativeKey,
+  }: {|
+    userId: string,
+    name: string,
+    args: Object,
+    toolsVersion: string,
+    projectSpecificExtensionsSummaryJson: string | null,
+    projectSpecificExtensionsSummaryJsonUserRelativeKey: string | null,
+  |}
+): Promise<LookupToolCall> => {
+  const authorizationHeader = await getAuthorizationHeader();
+  const response = await apiClient.post(
+    `/lookup-tool-call`,
+    {
+      name,
+      arguments: args,
+      gdevelopVersionWithHash: getIDEVersionWithHash(),
+      toolsVersion,
+      projectSpecificExtensionsSummaryJson,
+      projectSpecificExtensionsSummaryJsonUserRelativeKey,
+    },
+    {
+      params: {
+        userId,
+      },
+      headers: {
+        Authorization: authorizationHeader,
+      },
+    }
+  );
+  return ensureObjectHasProperty({
+    data: response.data,
+    propertyName: 'output',
+    endpointName: '/lookup-tool-call of Generation API',
+  });
+};
+
+export type AiUserContentPresignedUrlsResult = {
+  gameProjectJsonSignedUrl?: string,
+  gameProjectJsonUserRelativeKey?: string,
+  projectSpecificExtensionsSummaryJsonSignedUrl?: string,
+  projectSpecificExtensionsSummaryJsonUserRelativeKey?: string,
+  eventsJsonSignedUrl?: string,
+  eventsJsonUserRelativeKey?: string,
+};
+
+export const createAiUserContentPresignedUrls = async (
+  getAuthorizationHeader: () => Promise<string>,
+  {
+    userId,
+    gameProjectJsonHash,
+    projectSpecificExtensionsSummaryJsonHash,
+    eventsJsonHash,
+  }: {|
+    userId: string,
+    gameProjectJsonHash: string | null,
+    projectSpecificExtensionsSummaryJsonHash: string | null,
+    eventsJsonHash: string | null,
+  |}
+): Promise<AiUserContentPresignedUrlsResult> => {
+  const authorizationHeader = await getAuthorizationHeader();
+  const response = await apiClient.post(
+    `/ai-user-content/action/create-presigned-urls`,
+    {
+      gdevelopVersionWithHash: getIDEVersionWithHash(),
+      gameProjectJsonHash,
+      projectSpecificExtensionsSummaryJsonHash,
+      eventsJsonHash,
+    },
+    {
+      params: {
+        userId,
+      },
+      headers: {
+        Authorization: authorizationHeader,
+      },
+    }
+  );
+  return ensureIsObject({
+    data: response.data,
+    endpointName:
+      '/ai-user-content/action/create-presigned-urls of Generation API',
+  });
+};
+
+export type AiAttachmentUpload = {|
+  attachmentId: string,
+  uploadUrl: string,
+  visionCopyUploadUrl: string | null,
+|};
+
+export const createAiAttachmentUploads = async (
+  getAuthorizationHeader: () => Promise<string>,
+  {
+    userId,
+    files,
+  }: {|
+    userId: string,
+    files: Array<{|
+      name: string,
+      mimeType: string,
+      size: number,
+      visionCopy: {| mimeType: string, size: number |} | null,
+    |}>,
+  |}
+): Promise<Array<AiAttachmentUpload>> => {
+  const authorizationHeader = await getAuthorizationHeader();
+  const response = await apiClient.post(
+    `/ai-user-content/action/create-attachment-uploads`,
+    { files },
+    {
+      params: { userId },
+      headers: { Authorization: authorizationHeader },
+    }
+  );
+  return ensureIsArray({
+    data: response.data.attachmentUploads,
+    endpointName:
+      '/ai-user-content/action/create-attachment-uploads of Generation API',
+  });
+};
+
+export type AiAttachmentDownload =
+  | {|
+      attachmentId: string,
+      url: string,
+      // A downscaled copy for an image, if any (otherwise the file itself).
+      previewUrl: string,
+      name: string,
+      mimeType: string,
+      size: number,
+    |}
+  | {| attachmentId: string, error: 'not-found' |};
+
+export const createAiAttachmentDownloads = async (
+  getAuthorizationHeader: () => Promise<string>,
+  {
+    userId,
+    attachmentIds,
+  }: {|
+    userId: string,
+    attachmentIds: Array<string>,
+  |}
+): Promise<Array<AiAttachmentDownload>> => {
+  const authorizationHeader = await getAuthorizationHeader();
+  const response = await apiClient.post(
+    `/ai-user-content/action/create-attachment-downloads`,
+    { attachmentIds },
+    {
+      params: { userId },
+      headers: { Authorization: authorizationHeader },
+    }
+  );
+  return ensureIsArray({
+    data: response.data.attachmentDownloads,
+    endpointName:
+      '/ai-user-content/action/create-attachment-downloads of Generation API',
+  });
+};
+
+export type AiConfigurationPreset = {|
+  mode: 'chat' | 'agent' | 'orchestrator',
+  id: string,
+  nameByLocale: MessageByLocale,
+  reasoningLevelByLocale?: MessageByLocale,
+  reasoningLevel?: number,
+  disabled: boolean,
+  isDefault?: boolean,
+|};
+
+export type AiSettings = {
+  aiRequest: {
+    presets: Array<AiConfigurationPreset>,
+  },
+};
+
+export const forkAiRequest = async (
+  getAuthorizationHeader: () => Promise<string>,
+  {
+    userId,
+    aiRequestId,
+    upToMessageId,
+  }: {|
+    userId: string,
+    aiRequestId: string,
+    upToMessageId?: string,
+  |}
+): Promise<AiRequest> => {
+  const authorizationHeader = await getAuthorizationHeader();
+  const response = await apiClient.post(
+    `/ai-request/${aiRequestId}/action/fork`,
+    {
+      upToMessageId,
+    },
+    {
+      params: {
+        userId,
+      },
+      headers: {
+        Authorization: authorizationHeader,
+      },
+    }
+  );
+  return ensureObjectHasProperty({
+    data: response.data,
+    propertyName: 'id',
+    endpointName: '/ai-request/{id}/action/fork of Generation API',
+  });
+};
+
+export const fetchAiSettings = async ({
+  environment,
+}: {|
+  environment: Environment,
+|}): Promise<AiSettings> => {
+  // $FlowFixMe[underconstrained-implicit-instantiation]
+  const response = await axios.get(
+    `${GDevelopAiCdn.baseUrl[environment]}/ai-settings-v2.json`
+  );
+  return ensureObjectHasProperty({
+    data: response.data,
+    propertyName: 'aiRequest',
+    endpointName: '/ai-settings-v2.json of Generation API',
+  });
+};

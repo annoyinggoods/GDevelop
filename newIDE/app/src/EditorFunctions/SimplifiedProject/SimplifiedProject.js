@@ -1,0 +1,638 @@
+// @flow
+import { mapFor, mapVector } from '../../Utils/MapFor';
+import { isCollectionVariable } from '../../Utils/VariablesUtils';
+import {
+  buildExtensionSummary,
+  type ExtensionSummary,
+} from './ExtensionSummary';
+import { type FunctionAuthoringScope } from '../../InstructionOrExpression/EnumeratedInstructionOrExpressionMetadata';
+import {
+  makeSimplifiedExtensionsBuilder,
+  getSimplifiedTests,
+  type SimplifiedExtension,
+  type SimplifiedCustomObject,
+  type SimplifiedCustomBehavior,
+  type SimplifiedCustomObjectVariant,
+} from './SimplifiedExtensions';
+
+export type SimplifiedBehavior = {|
+  behaviorName: string,
+  behaviorType: string,
+  // Only for objects synchronized with other players (multiplayer).
+  isSynchronizedOverNetwork?: boolean,
+|};
+
+export type SimplifiedVariable = {|
+  variableName: string,
+  type: string,
+  value?: string,
+  variableChildren?: Array<SimplifiedVariable>,
+|};
+
+export type SimplifiedObject = {|
+  objectName: string,
+  objectType: string,
+  behaviors?: Array<SimplifiedBehavior>,
+  objectVariables?: Array<SimplifiedVariable>,
+  animationNames?: string,
+|};
+
+export type SimplifiedObjectGroup = {|
+  objectGroupName: string,
+  objectGroupType: string,
+  objectNames: Array<string>,
+  behaviors?: Array<SimplifiedBehavior>,
+  variables?: Array<SimplifiedVariable>,
+|};
+
+export type SimplifiedLayer = {|
+  layerName: string,
+  position: number,
+  isBaseLayer?: boolean,
+|};
+
+type SimplifiedScene = {|
+  sceneName: string,
+  objects: Array<SimplifiedObject>,
+  objectGroups: Array<SimplifiedObjectGroup>,
+  sceneVariables: Array<SimplifiedVariable>,
+  layers: Array<SimplifiedLayer>,
+  instancesOnSceneDescription: string,
+|};
+
+// An external layout: instances placed apart from a scene (a level chunk, a
+// UI template...), using the objects and layers of its associated scene.
+export type SimplifiedExternalLayout = {|
+  externalLayoutName: string,
+  associatedSceneName: string,
+  instancesCount: number,
+|};
+
+export type SimplifiedExternalEvents = {|
+  externalEventsName: string,
+  // The scene giving the objects and variables the events are edited with
+  // ("" when not set). The events run in the scenes linking to them.
+  associatedSceneName: string,
+  eventsCount: number,
+|};
+
+type SimplifiedResource = {|
+  name: string,
+  type: string,
+  file: string,
+  metadata?: string,
+|};
+
+export type SimplifiedTest = {|
+  testName: string,
+  type: string,
+  description?: string,
+  source?: string,
+  lastRunStatus?: string,
+  lastRunAt?: number,
+|};
+
+export type SimplifiedProject = {|
+  properties: {|
+    name: string,
+    gameResolutionWidth: number,
+    gameResolutionHeight: number,
+    orientation: string,
+    scaleMode: string,
+    firstLayout: string,
+  |},
+  globalObjects: Array<SimplifiedObject>,
+  globalObjectGroups: Array<SimplifiedObjectGroup>,
+  scenes: Array<SimplifiedScene>,
+  // The external layouts of the project (their instances are read with
+  // `describe_instances` on an `external_layout` scope). Absent from the
+  // projects sent by older editors.
+  externalLayouts: Array<SimplifiedExternalLayout>,
+  // The external events of the project (their events are read with
+  // `read_events_source` on an `external_events` scope). Absent from the
+  // projects sent by older editors.
+  externalEvents: Array<SimplifiedExternalEvents>,
+  globalVariables: Array<SimplifiedVariable>,
+  resources: Array<SimplifiedResource>,
+  tests?: Array<SimplifiedTest>,
+  // Declarations of the events-based extensions of the project (never their events).
+  extensions: Array<SimplifiedExtension>,
+|};
+
+type ProjectSpecificExtensionsSummary = {|
+  extensionSummaries: Array<ExtensionSummary>,
+|};
+
+export type SimplifiedProjectOptions = {|
+  scopeToScene?: string,
+|};
+
+export const getVariableTypeAsString = (
+  gd: libGDevelop,
+  variable: gdVariable
+): string => {
+  const type = variable.getType();
+  return type === gd.Variable.String
+    ? 'String'
+    : type === gd.Variable.Number
+    ? 'Number'
+    : type === gd.Variable.Boolean
+    ? 'Boolean'
+    : type === gd.Variable.Structure
+    ? 'Structure'
+    : type === gd.Variable.Array
+    ? 'Array'
+    : 'unknown';
+};
+
+const getVariableValueAsString = (
+  gd: libGDevelop,
+  variable: gdVariable
+): string => {
+  const type = variable.getType();
+  return type === gd.Variable.Structure || type === gd.Variable.Array
+    ? variable.getChildrenCount() === 0
+      ? `No children`
+      : variable.getChildrenCount() === 1
+      ? `1 child`
+      : `${variable.getChildrenCount()} children`
+    : type === gd.Variable.String
+    ? variable.getString()
+    : type === gd.Variable.Number
+    ? variable.getValue().toString()
+    : type === gd.Variable.Boolean
+    ? variable.getBool()
+      ? `True`
+      : `False`
+    : 'unknown';
+};
+
+// Serialize a variable (and its children, recursively) to the shape used in the
+// GAME_PROJECT_JSON overview, so inspection tools and the overview stay in sync.
+// Array children are named by their index ("0", "1", ...), matching the
+// `MyArray[0]` path syntax used by `add_or_edit_variable`.
+export const getSimplifiedVariable = (
+  gd: libGDevelop,
+  name: string,
+  variable: gdVariable
+): SimplifiedVariable => {
+  if (isCollectionVariable(variable)) {
+    if (variable.getType() === gd.Variable.Structure) {
+      return {
+        variableName: name,
+        type: getVariableTypeAsString(gd, variable),
+        variableChildren: variable
+          .getAllChildrenNames()
+          .toJSArray()
+          .map(childName =>
+            getSimplifiedVariable(gd, childName, variable.getChild(childName))
+          ),
+      };
+    } else if (variable.getType() === gd.Variable.Array) {
+      return {
+        variableName: name,
+        type: getVariableTypeAsString(gd, variable),
+        variableChildren: mapFor(0, variable.getChildrenCount(), index =>
+          getSimplifiedVariable(
+            gd,
+            index.toString(),
+            variable.getAtIndex(index)
+          )
+        ),
+      };
+    }
+  }
+
+  return {
+    variableName: name,
+    type: getVariableTypeAsString(gd, variable),
+    value: getVariableValueAsString(gd, variable),
+  };
+};
+
+export const getSimplifiedVariablesContainer = (
+  gd: libGDevelop,
+  container: gdVariablesContainer
+): Array<SimplifiedVariable> => {
+  return mapFor(0, container.count(), (index: number) => {
+    const name = container.getNameAt(index);
+    const variable = container.getAt(index);
+    return getSimplifiedVariable(gd, name, variable);
+  }).filter(Boolean);
+};
+
+/**
+ * Options of the extensions summary sent to the AI: by default the private
+ * members of the extensions are left out (they can't be called from outside).
+ * `authoringScope` tells where the events being written are authored, so that
+ * exactly the private members callable from there are described.
+ */
+export type ProjectSpecificExtensionsSummaryOptions = {|
+  authoringScope?: FunctionAuthoringScope | null,
+|};
+
+export type SimplifiedProjectBuilder = {|
+  getProjectSpecificExtensionsSummary: (
+    project: gdProject,
+    options?: ProjectSpecificExtensionsSummaryOptions
+  ) => ProjectSpecificExtensionsSummary,
+  getSimplifiedProject: (
+    project: gdProject,
+    options: SimplifiedProjectOptions
+  ) => SimplifiedProject,
+  getSimplifiedExtension: (
+    eventsFunctionsExtension: gdEventsFunctionsExtension
+  ) => SimplifiedExtension,
+  getSimplifiedCustomObject: (
+    eventsBasedObject: gdEventsBasedObject
+  ) => SimplifiedCustomObject,
+  getSimplifiedCustomBehavior: (
+    eventsBasedBehavior: gdEventsBasedBehavior
+  ) => SimplifiedCustomBehavior,
+  getSimplifiedCustomObjectVariant: (
+    variant: gdEventsBasedObjectVariant
+  ) => SimplifiedCustomObjectVariant,
+|};
+
+export const makeSimplifiedProjectBuilder = (
+  gd: libGDevelop
+): SimplifiedProjectBuilder => {
+  const getSimplifiedObject = (object: gdObject): SimplifiedObject => {
+    const objectVariables = getSimplifiedVariablesContainer(
+      gd,
+      object.getVariables()
+    );
+    const behaviors = object
+      .getAllBehaviorNames()
+      .toJSArray()
+      .map(
+        (behaviorName): SimplifiedBehavior | null => {
+          const behavior = object.getBehavior(behaviorName);
+
+          return {
+            behaviorName: behavior.getName(),
+            behaviorType: behavior.getTypeName(),
+          };
+        }
+      )
+      .filter(Boolean);
+
+    const simplifiedObject: SimplifiedObject = {
+      objectName: object.getName(),
+      objectType: object.getType(),
+    };
+
+    if (behaviors.length > 0) {
+      simplifiedObject.behaviors = behaviors;
+    }
+    if (objectVariables.length > 0) {
+      simplifiedObject.objectVariables = objectVariables;
+    }
+
+    const objectConfiguration = object.getConfiguration();
+    const animationNames = mapFor(
+      0,
+      objectConfiguration.getAnimationsCount(),
+      i => {
+        return (
+          objectConfiguration.getAnimationName(i) ||
+          `(animation without name, animation index is: ${i})`
+        );
+      }
+    );
+    if (animationNames.length > 0) {
+      simplifiedObject.animationNames = animationNames.join(', ');
+    }
+
+    return simplifiedObject;
+  };
+
+  const getSimplifiedObjectsJson = (
+    objects: gdObjectsContainer
+  ): Array<SimplifiedObject> => {
+    return mapFor(0, objects.getObjectsCount(), i => {
+      const object = objects.getObjectAt(i);
+      return getSimplifiedObject(object);
+    });
+  };
+
+  const getSimplifiedObjectGroups = (
+    objectGroups: gdObjectGroupsContainer,
+    objectsContainersList: gdObjectsContainersList
+  ): Array<SimplifiedObjectGroup> => {
+    return mapFor(0, objectGroups.count(), i => {
+      const objectGroup = objectGroups.getAt(i);
+
+      const behaviorNames = objectsContainersList
+        .getBehaviorsOfObject(objectGroup.getName(), true)
+        .toJSArray();
+
+      const variablesContainer = gd.ObjectRefactorer.mergeVariableContainers(
+        objectsContainersList,
+        objectGroup
+      );
+
+      return {
+        objectGroupName: objectGroup.getName(),
+        objectGroupType: objectsContainersList.getTypeOfObject(
+          objectGroup.getName()
+        ),
+        objectNames: objectGroup.getAllObjectsNames().toJSArray(),
+        behaviors:
+          behaviorNames.length > 0
+            ? behaviorNames.map(behaviorName => ({
+                behaviorName,
+                behaviorType: objectsContainersList.getTypeOfBehaviorInObjectOrGroup(
+                  objectGroup.getName(),
+                  behaviorName,
+                  true
+                ),
+              }))
+            : undefined,
+        variables:
+          variablesContainer.count() > 0
+            ? getSimplifiedVariablesContainer(gd, variablesContainer)
+            : undefined,
+      };
+    });
+  };
+
+  const getSimplifiedResourcesJson = (
+    resources: gdResourcesContainer
+  ): Array<SimplifiedResource> => {
+    return resources
+      .getAllResourceNames()
+      .toJSArray()
+      .map(resourceName => {
+        const resource = resources.getResource(resourceName);
+        return {
+          name: resourceName,
+          type: resource.getKind(),
+          file: resource.getFile(),
+          metadata: resource.getMetadata() ? resource.getMetadata() : undefined,
+        };
+      });
+  };
+
+  const getSimplifiedLayers = (
+    layers: gdLayersContainer
+  ): Array<SimplifiedLayer> => {
+    return mapFor(0, layers.getLayersCount(), i => {
+      const layer = layers.getLayerAt(i);
+      return {
+        layerName: layer.getName(),
+        position: i,
+        isBaseLayer: layer.getName() === '' ? true : undefined,
+      };
+    });
+  };
+
+  const getInstancesDescription = (
+    initialInstances: gdInitialInstancesContainer,
+    layersContainer: gdLayersContainer,
+    containerKind: 'scene' | 'custom-object'
+  ): string => {
+    let isEmpty = true;
+    const instancesCountPerLayer: { [string]: { [string]: number } } = {};
+
+    const instancesListerFunctor = new gd.InitialInstanceJSFunctor();
+    // $FlowFixMe[incompatible-type] - invoke is not writable
+    // $FlowFixMe[cannot-write]
+    instancesListerFunctor.invoke = instancePtr => {
+      // $FlowFixMe[incompatible-type] - wrapPointer is not exposed
+      const instance: gdInitialInstance = gd.wrapPointer(
+        // $FlowFixMe[incompatible-type]
+        instancePtr,
+        gd.InitialInstance
+      );
+      const name = instance.getObjectName();
+      if (!name) return;
+
+      const layer = instance.getLayer();
+
+      const layerInstancesCount = (instancesCountPerLayer[layer] =
+        instancesCountPerLayer[layer] || {});
+      layerInstancesCount[name] = (layerInstancesCount[name] || 0) + 1;
+      isEmpty = false;
+    };
+    // $FlowFixMe[incompatible-type] - JSFunctor is incompatible with Functor
+    initialInstances.iterateOverInstances(instancesListerFunctor);
+    instancesListerFunctor.delete();
+
+    if (isEmpty) {
+      return containerKind === 'scene'
+        ? 'There are no instances of objects placed on the scene - the scene is empty.'
+        : 'There are no instances of child objects placed in this variant of the custom object - it is empty.';
+    }
+
+    return [
+      containerKind === 'scene'
+        ? `On the scene, there are:`
+        : `In this variant of the custom object, there are:`,
+      ...mapFor(0, layersContainer.getLayersCount(), i => {
+        const layer = layersContainer.getLayerAt(i);
+        const layerName = layer.getName();
+        const layerInstancesCount = instancesCountPerLayer[layerName];
+
+        return [
+          layerName ? `- on layer "${layer.getName()}":` : `- on base layer:`,
+          !layerInstancesCount || Object.keys(layerInstancesCount).length === 0
+            ? `  - Nothing (no instances)`
+            : Object.keys(layerInstancesCount)
+                .map(name => `  - ${layerInstancesCount[name]} ${name}`)
+                .join('\n'),
+        ].join('\n');
+      }),
+      '',
+      containerKind === 'scene'
+        ? `Inspect instances on the scene to get more details if needed.`
+        : `Inspect instances of this variant to get more details if needed.`,
+    ].join('\n');
+  };
+
+  const simplifiedExtensionsBuilder = makeSimplifiedExtensionsBuilder(gd, {
+    getSimplifiedObjectsJson,
+    getSimplifiedObjectGroups,
+    getSimplifiedLayers,
+    getInstancesDescription,
+    getSimplifiedVariablesContainer: container =>
+      getSimplifiedVariablesContainer(gd, container),
+  });
+
+  const getSimplifiedScene = (
+    project: gdProject,
+    scene: gdLayout
+  ): SimplifiedScene => {
+    const projectScopedContainers = gd.ProjectScopedContainers.makeNewProjectScopedContainersForProjectAndLayout(
+      project,
+      scene
+    );
+
+    return {
+      sceneName: scene.getName(),
+      objects: getSimplifiedObjectsJson(scene.getObjects()),
+      objectGroups: getSimplifiedObjectGroups(
+        scene.getObjects().getObjectGroups(),
+        projectScopedContainers.getObjectsContainersList()
+      ),
+      sceneVariables: getSimplifiedVariablesContainer(gd, scene.getVariables()),
+      layers: getSimplifiedLayers(scene.getLayers()),
+      instancesOnSceneDescription: getInstancesDescription(
+        scene.getInitialInstances(),
+        scene.getLayers(),
+        'scene'
+      ),
+    };
+  };
+
+  // The full structure is intentionally uncapped here — the backend trims
+  // it if needed, and `read_game_project_json` reads it with its own token
+  // budget (see SimplifiedProjectReader.js).
+  const getSimplifiedProject = (
+    project: gdProject,
+    options: SimplifiedProjectOptions
+  ): SimplifiedProject => {
+    const globalObjects = getSimplifiedObjectsJson(project.getObjects());
+    const scenes = mapFor(0, project.getLayoutsCount(), i => {
+      const scene = project.getLayoutAt(i);
+      if (options.scopeToScene && scene.getName() !== options.scopeToScene)
+        return null;
+
+      return getSimplifiedScene(project, scene);
+    }).filter(Boolean);
+    const externalLayouts = mapFor(0, project.getExternalLayoutsCount(), i => {
+      const externalLayout = project.getExternalLayoutAt(i);
+      const associatedSceneName = externalLayout.getAssociatedLayout();
+      if (options.scopeToScene && associatedSceneName !== options.scopeToScene)
+        return null;
+
+      return {
+        externalLayoutName: externalLayout.getName(),
+        associatedSceneName,
+        instancesCount: externalLayout
+          .getInitialInstances()
+          .getInstancesCount(),
+      };
+    }).filter(Boolean);
+    const externalEvents = mapFor(0, project.getExternalEventsCount(), i => {
+      const projectExternalEvents = project.getExternalEventsAt(i);
+      const associatedSceneName = projectExternalEvents.getAssociatedLayout();
+      if (
+        options.scopeToScene &&
+        associatedSceneName &&
+        associatedSceneName !== options.scopeToScene
+      )
+        return null;
+
+      return {
+        externalEventsName: projectExternalEvents.getName(),
+        associatedSceneName,
+        eventsCount: projectExternalEvents.getEvents().getEventsCount(),
+      };
+    }).filter(Boolean);
+
+    const projectScopedContainers = gd.ProjectScopedContainers.makeNewProjectScopedContainersForProject(
+      project
+    );
+
+    // Filter extensions to only include extensions from the project.
+
+    const simplifiedProject: SimplifiedProject = {
+      properties: {
+        name: project.getName(),
+        gameResolutionWidth: project.getGameResolutionWidth(),
+        gameResolutionHeight: project.getGameResolutionHeight(),
+        orientation: project.getOrientation(),
+        scaleMode: project.getScaleMode(),
+        firstLayout: project.getFirstLayout(),
+      },
+      resources: getSimplifiedResourcesJson(project.getResourcesManager()),
+      globalObjects,
+      globalObjectGroups: getSimplifiedObjectGroups(
+        project.getObjects().getObjectGroups(),
+        projectScopedContainers.getObjectsContainersList()
+      ),
+      scenes,
+      externalLayouts,
+      externalEvents,
+      globalVariables: getSimplifiedVariablesContainer(
+        gd,
+        project.getVariables()
+      ),
+      extensions: simplifiedExtensionsBuilder.getSimplifiedExtensions(project),
+    };
+
+    const projectTests = getSimplifiedTests(project.getTests());
+    if (projectTests.length > 0) {
+      simplifiedProject.tests = projectTests;
+    }
+
+    return simplifiedProject;
+  };
+
+  const getProjectSpecificExtensionsSummary = (
+    project: gdProject,
+    options?: ProjectSpecificExtensionsSummaryOptions
+  ): ProjectSpecificExtensionsSummary => {
+    const authoringScope = (options && options.authoringScope) || null;
+    const startTime = Date.now();
+    const platform = project.getCurrentPlatform();
+    const allExtensions = platform.getAllPlatformExtensions();
+
+    const projectExtensionNames = new Set(
+      mapFor(0, project.getEventsFunctionsExtensionsCount(), i => {
+        const extension = project.getEventsFunctionsExtensionAt(i);
+        return extension.getName();
+      })
+    );
+
+    const projectSpecificExtensions: Array<gdPlatformExtension> = mapVector(
+      allExtensions,
+      extension => {
+        if (projectExtensionNames.has(extension.getName())) {
+          return extension;
+        }
+        return null;
+      }
+    ).filter(Boolean);
+
+    const extensionsSummary: ProjectSpecificExtensionsSummary = {
+      extensionSummaries: projectSpecificExtensions.map(extension => {
+        const extensionName = extension.getName();
+        const eventsFunctionsExtension = project.hasEventsFunctionsExtensionNamed(
+          extensionName
+        )
+          ? project.getEventsFunctionsExtension(extensionName)
+          : null;
+
+        return buildExtensionSummary({
+          gd,
+          eventsFunctionsExtension,
+          extension,
+          authoringScope,
+        });
+      }),
+    };
+
+    const duration = Date.now() - startTime;
+    console.info(
+      `Project specific extensions summary generated in ${duration.toFixed(
+        0
+      )}ms`
+    );
+
+    return extensionsSummary;
+  };
+
+  return {
+    getSimplifiedProject,
+    getProjectSpecificExtensionsSummary,
+    getSimplifiedExtension: simplifiedExtensionsBuilder.getSimplifiedExtension,
+    getSimplifiedCustomObject:
+      simplifiedExtensionsBuilder.getSimplifiedCustomObject,
+    getSimplifiedCustomBehavior:
+      simplifiedExtensionsBuilder.getSimplifiedCustomBehavior,
+    getSimplifiedCustomObjectVariant:
+      simplifiedExtensionsBuilder.getSimplifiedCustomObjectVariant,
+  };
+};

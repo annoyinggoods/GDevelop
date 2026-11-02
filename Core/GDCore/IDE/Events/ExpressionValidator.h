@@ -1,0 +1,766 @@
+/*
+ * GDevelop Core
+ * Copyright 2008-present Florian Rival (Florian.Rival@gmail.com). All rights
+ * reserved. This project is released under the MIT License.
+ */
+#pragma once
+
+#include <memory>
+#include <vector>
+#include "GDCore/Events/Parsers/ExpressionParser2Node.h"
+#include "GDCore/Events/Parsers/ExpressionParser2NodeWorker.h"
+#include "GDCore/Tools/MakeUnique.h"
+#include "GDCore/Tools/Localization.h"
+#include "GDCore/Project/ProjectScopedContainers.h"
+#include "GDCore/Project/VariablesContainersList.h"
+#include "GDCore/Project/VariablesContainer.h"
+
+namespace gd {
+class Expression;
+class ObjectsContainer;
+class VariablesContainer;
+class Platform;
+class VariablesContainersList;
+class ProjectScopedContainers;
+}  // namespace gd
+
+namespace gd {
+
+/**
+ * \brief Validate that an expression is properly written by returning
+ * any error attached to the nodes during parsing.
+ *
+ * \see gd::ExpressionParser2
+ */
+class GD_CORE_API ExpressionValidator : public ExpressionParser2NodeWorker {
+ public:
+  ExpressionValidator(const gd::Platform &platform_,
+                      const gd::ProjectScopedContainers & projectScopedContainers_,
+                      const gd::String &rootType_,
+                      const gd::String &rootObjectName_ = emptyParameterExtraInfo,
+                      const gd::String &extraInfo_ = emptyParameterExtraInfo)
+      : platform(platform_),
+        projectScopedContainers(projectScopedContainers_),
+        parentType(StringToType(gd::ValueTypeMetadata::GetExpressionPrimitiveValueType(rootType_))),
+        rootObjectName(rootObjectName_),
+        childType(Type::Unknown),
+        forbidsUsageOfBracketsBecauseParentIsObject(false),
+        currentParameterExtraInfo(extraInfo_),
+        variableObjectName(),
+        variableObjectNameLocation() {};
+  virtual ~ExpressionValidator(){};
+
+  /**
+   * \brief Helper function to check if a given node does not contain
+   * any error including non-fatal ones.
+   */
+  static bool HasNoErrors(const gd::Platform &platform,
+                      const gd::ProjectScopedContainers & projectScopedContainers,
+                      const gd::String &rootType,
+                      gd::ExpressionNode& node) {
+    gd::ExpressionValidator validator(platform, projectScopedContainers, rootType);
+    node.Visit(validator);
+    return validator.GetAllErrors().empty();
+  }
+
+  /**
+   * \brief Get only the fatal errors
+   *
+   * Expressions with fatal error can't be generated.
+   */
+  const std::vector<ExpressionParserError*>& GetFatalErrors() {
+    return fatalErrors;
+  };
+
+  /**
+   * \brief Get all the errors
+   *
+   * No errors means that the expression is valid.
+   */
+  const std::vector<ExpressionParserError*>& GetAllErrors() {
+    return allErrors;
+  };
+
+  /**
+   * \brief Get all deprecation warnings
+   */
+  const std::vector<ExpressionParserError*> &
+  GetDeprecationWarnings() {
+    return deprecationWarnings;
+  };
+
+ protected:
+  void OnVisitSubExpressionNode(SubExpressionNode& node) override {
+    isDirectChildOfVariableBracketAccessorNode = false;
+    ReportAnyError(node);
+    node.expression->Visit(*this);
+  }
+  void OnVisitOperatorNode(OperatorNode& node) override {
+    isDirectChildOfVariableBracketAccessorNode = false;
+    ReportAnyError(node);
+
+    // The "required" type ("parentType")  will be used when visiting the first operand.
+    // Note that it may be refined thanks to this first operand (see later).
+    node.leftHandSide->Visit(*this);
+    const Type leftType = childType; // Store the type of the first operand.
+
+    if (parentType == Type::Variable ||
+        parentType == Type::VariableOrProperty ||
+        parentType == Type::VariableOrPropertyOrParameter ||
+        parentType == Type::ObjectVariable ||
+        parentType == Type::LegacyVariable) {
+      RaiseOperatorError(
+          _("Operators (+, -, /, *) can't be used in variable names. Remove "
+            "the operator from the variable name."),
+          node.rightHandSide->location);
+    } else if (leftType == Type::Number) {
+      if (node.op == ' ') {
+        RaiseError(gd::ExpressionParserError::ErrorType::SyntaxError,
+            "No operator found. Did you forget to enter an operator (like +, -, "
+            "* or /) between numbers or expressions?", node.rightHandSide->location);
+      }
+    } else if (leftType == Type::String) {
+      if (node.op == ' ') {
+        RaiseError(gd::ExpressionParserError::ErrorType::SyntaxError,
+            "You must add the operator + between texts or expressions. For "
+            "example: \"Your name: \" + VariableString(PlayerName).", node.rightHandSide->location);
+      }
+      else if (node.op != '+') {
+        RaiseOperatorError(
+            _("You've used an operator that is not supported. Only + can be used "
+              "to concatenate texts."),
+            ExpressionParserLocation(node.leftHandSide->location.GetEndPosition() + 1, node.location.GetEndPosition()));
+      }
+    } else if (leftType == Type::Object) {
+      RaiseOperatorError(
+          _("Operators (+, -, /, *) can't be used with an object name. Remove "
+            "the operator."),
+            node.rightHandSide->location);
+    }
+
+    // The "required" type ("parentType") of the second operator is decided by:
+    // - the parent type. Unless it can (`number|string`) or should (`unknown`) be refined, then:
+    // - the first operand.
+    parentType = ShouldTypeBeRefined(parentType) ? leftType : parentType;
+    node.rightHandSide->Visit(*this);
+    const Type rightType = childType;
+
+    // The type of the overall operator ("childType") is decided by:
+    // - the parent type. Unless it can (`number|string`) or should (`unknown`) be refined, then:
+    // - the first operand. Unless it can (`number|string`) or should (`unknown`) be refined, then:
+    // - the right operand (which got visited knowing the type of the first operand, so it's
+    // equal or strictly more precise than the left operand).
+    childType = ShouldTypeBeRefined(parentType) ? (ShouldTypeBeRefined(leftType) ? leftType : rightType) : parentType;
+  }
+  void OnVisitUnaryOperatorNode(UnaryOperatorNode& node) override {
+    isDirectChildOfVariableBracketAccessorNode = false;
+    ReportAnyError(node);
+    node.factor->Visit(*this);
+    const Type rightType = childType;
+
+    if (parentType == Type::Variable ||
+        parentType == Type::VariableOrProperty ||
+        parentType == Type::VariableOrPropertyOrParameter ||
+        parentType == Type::ObjectVariable ||
+        parentType == Type::LegacyVariable) {
+      RaiseTypeError(
+          _("Operators (+, -) can't be used in variable names. Remove "
+            "the operator from the variable name."),
+          node.location);
+    } else if (rightType == Type::Number) {
+      if (node.op != '+' && node.op != '-') {
+        // This is actually a dead code because the parser takes them as
+        // binary operations with an empty left side which makes as much sense.
+        RaiseTypeError(
+          _("You've used an \"unary\" operator that is not supported. Operator "
+            "should be "
+            "either + or -."),
+          node.location);
+      }
+    } else if (rightType == Type::String) {
+      RaiseTypeError(
+          _("You've used an operator that is not supported. Only + can be used "
+            "to concatenate texts, and must be placed between two texts (or "
+            "expressions)."),
+          node.location);
+    } else if (rightType == Type::Object) {
+      RaiseTypeError(
+          _("Operators (+, -) can't be used with an object name. Remove the "
+            "operator."),
+          node.location);
+    }
+  }
+  void OnVisitNumberNode(NumberNode& node) override {
+    isDirectChildOfVariableBracketAccessorNode = false;
+    ReportAnyError(node);
+    childType = Type::Number;
+    if (parentType == Type::String) {
+      RaiseTypeError(
+          _("You entered a number, but a text was expected (in quotes)."),
+          node.location);
+    } else if (parentType == Type::Variable ||
+               parentType == Type::VariableOrProperty ||
+               parentType == Type::VariableOrPropertyOrParameter ||
+               parentType == Type::ObjectVariable ||
+               parentType == Type::LegacyVariable) {
+      RaiseTypeError(
+          _("The variable name looks like you're building an expression or a "
+            "formula. You can only use this for structure or arrays, for "
+            "example: Score[3]."),
+          node.location);
+    } else if (parentType != Type::Number &&
+               parentType != Type::NumberOrString) {
+      RaiseTypeError(_("You entered a number, but this type was expected:") +
+                         " " + TypeToString(parentType),
+                     node.location);
+    }
+  }
+  void OnVisitTextNode(TextNode& node) override {
+    isDirectChildOfVariableBracketAccessorNode = false;
+    ReportAnyError(node);
+    childType = Type::String;
+    if (parentType == Type::Number) {
+      RaiseTypeError(_("You entered a text, but a number was expected."),
+                     node.location);
+    } else if (parentType == Type::Variable ||
+               parentType == Type::VariableOrProperty ||
+               parentType == Type::VariableOrPropertyOrParameter ||
+               parentType == Type::ObjectVariable ||
+               parentType == Type::LegacyVariable) {
+      RaiseTypeError(
+          _("The variable name looks like you're building an expression or a "
+            "formula. You can only use this for structure or arrays, for "
+            "example: Score[\"Player1\"]."),
+          node.location);
+    } else if (parentType != Type::String &&
+               parentType != Type::NumberOrString) {
+      RaiseTypeError(_("You entered a text, but this type was expected:") +
+                         " " + TypeToString(parentType),
+                     node.location);
+    }
+  }
+  void OnVisitVariableNode(VariableNode& node) override {
+    isDirectChildOfVariableBracketAccessorNode = false;
+    ReportAnyError(node);
+    parentVariable = nullptr;
+    variableChildDepth = 0;
+
+    if (parentType == Type::Variable ||
+        parentType == Type::VariableOrProperty ||
+        parentType == Type::VariableOrPropertyOrParameter) {
+      childType = parentType;
+
+      bool isRootVariableDeclared = CheckVariableExistence(
+          node.location, node.name, node.child != nullptr);
+      if (node.child) {
+        if (isRootVariableDeclared) {
+          const auto &variable =
+              projectScopedContainers.GetVariablesContainersList().Get(
+                  node.name);
+          parentVariable = &variable;
+        }
+        node.child->Visit(*this);
+      }
+    } else if (parentType == Type::ObjectVariable) {
+      childType = parentType;
+
+      if (!rootObjectName.empty()) {
+        ValidateObjectVariableOrVariableOrProperty(
+            rootObjectName, node.nameLocation, node.name, node.nameLocation,
+            false, !!node.child);
+
+        const auto &objectsContainersList =
+            projectScopedContainers.GetObjectsContainersList();
+        auto variableExistence =
+            objectsContainersList.HasObjectOrGroupWithVariableNamed(
+                rootObjectName, node.name);
+        if (variableExistence == gd::ObjectsContainersList::Exists) {
+          const auto &objectVariable =
+              objectsContainersList
+                  .GetObjectOrGroupVariablesContainer(rootObjectName)
+                  ->Get(node.name);
+          if (node.child) {
+            parentVariable = &objectVariable;
+          } else {
+            ValidateLastChildVariable(objectVariable, node.nameLocation);
+          }
+        }
+        rootObjectName = "";
+      }
+      if (node.child) {
+        node.child->Visit(*this);
+      }
+    } else if (parentType == Type::LegacyVariable) {
+      childType = parentType;
+
+      if (node.child) {
+        node.child->Visit(*this);
+      }
+    } else if (parentType == Type::String || parentType == Type::Number ||
+               parentType == Type::NumberOrString) {
+      // The node represents a variable or an object variable in an expression waiting for its *value* to be returned.
+      childType = parentType;
+
+      const auto& variablesContainersList = projectScopedContainers.GetVariablesContainersList();
+      const auto& objectsContainersList = projectScopedContainers.GetObjectsContainersList();
+      const auto& propertiesContainerList = projectScopedContainers.GetPropertiesContainersList();
+
+      forbidsUsageOfBracketsBecauseParentIsObject = false;
+      projectScopedContainers.MatchIdentifierWithName<void>(node.name,
+        [&]() {
+          // This represents an object.
+          variableObjectName = node.name;
+          variableObjectNameLocation = node.nameLocation;
+          // While understood by the parser, it's forbidden to use the bracket notation just after
+          // an object name (`MyObject["MyVariable"]`).
+          forbidsUsageOfBracketsBecauseParentIsObject = true;
+        }, [&]() {
+          // This is a variable.
+          const auto &variable =
+              projectScopedContainers.GetVariablesContainersList().Get(
+                  node.name);
+          if (node.child) {
+            parentVariable = &variable;
+          } else {
+            ValidateLastChildVariable(variable, node.location);
+          }
+        }, [&]() {
+          // This is a property.
+          // Being in this node implies that there is at least a child - which is not supported for properties.
+          RaiseTypeError(_("Accessing a child variable of a property is not possible - just write the property name."),
+              node.location);
+        }, [&]() {
+          // This is a parameter.
+          // Being in this node implies that there is at least a child - which is not supported for parameters.
+          RaiseTypeError(_("Accessing a child variable of a parameter is not possible - just write the parameter name."),
+              node.location);
+        }, [&]() {
+          // This is something else.
+          RaiseTypeError(_("No object, variable or property with this name found."),
+              node.location);
+        });
+
+      if (node.child) {
+        node.child->Visit(*this);
+      }
+
+      forbidsUsageOfBracketsBecauseParentIsObject = false;
+    } else {
+      RaiseTypeError(_("You entered a variable, but this type was expected:") +
+                         " " + TypeToString(parentType),
+                     node.location);
+
+      if (node.child) {
+        node.child->Visit(*this);
+      }
+    }
+  }
+  void OnVisitVariableAccessorNode(VariableAccessorNode& node) override {
+    isDirectChildOfVariableBracketAccessorNode = false;
+    ReportAnyError(node);
+    // TODO Also check child-variables existence on a path with only VariableAccessor to raise non-fatal errors.
+    if (!variableObjectName.empty()) {
+      ValidateObjectVariableOrVariableOrProperty(
+          variableObjectName, variableObjectNameLocation, node.name,
+          node.nameLocation, true, !!node.child);
+
+      const auto &objectsContainersList =
+          projectScopedContainers.GetObjectsContainersList();
+      auto variableExistence =
+          objectsContainersList.HasObjectOrGroupWithVariableNamed(
+              variableObjectName, node.name);
+      if (variableExistence == gd::ObjectsContainersList::Exists) {
+        const auto &objectVariable =
+            objectsContainersList
+                .GetObjectOrGroupVariablesContainer(variableObjectName)
+                ->Get(node.name);
+        if (node.child) {
+          parentVariable = &objectVariable;
+        } else {
+          parentVariable = nullptr;
+        }
+      } else {
+        parentVariable = nullptr;
+      }
+      variableChildDepth = 0;
+      variableObjectName = "";
+    } else if (parentVariable) {
+      const bool isChildVariableDeclared = ValidateChildVariable(
+          *parentVariable, node.name, node.nameLocation, false);
+      if (isChildVariableDeclared) {
+        const auto &childVariable = parentVariable->GetChild(node.name);
+        if (node.child) {
+          parentVariable = &childVariable;
+          variableChildDepth++;
+        } else {
+          ValidateLastChildVariable(childVariable, node.nameLocation);
+          parentVariable = nullptr;
+          variableChildDepth = 0;
+        }
+      }
+      else {
+        parentVariable = nullptr;
+        variableChildDepth = 0;
+      }
+    }
+    // In the case we accessed an object variable (`MyObject.MyVariable`),
+    // brackets can now be used (`MyObject.MyVariable["MyChildVariable"]` is now valid).
+    forbidsUsageOfBracketsBecauseParentIsObject = false;
+
+    if (node.child) {
+      node.child->Visit(*this);
+    }
+  }
+  void OnVisitVariableBracketAccessorNode(
+      VariableBracketAccessorNode& node) override {
+    ReportAnyError(node);
+
+    variableObjectName = "";
+    parentVariable = nullptr;
+    variableChildDepth = 0;
+    if (forbidsUsageOfBracketsBecauseParentIsObject) {
+      RaiseError(gd::ExpressionParserError::ErrorType::BracketsNotAllowedForObjects,
+                 _("You can't use the brackets to access an object variable. "
+                   "Use a dot followed by the variable name, like this: "
+                   "`MyObject.MyVariable`."),
+                 node.location);
+    }
+    forbidsUsageOfBracketsBecauseParentIsObject = false;
+
+    Type currentParentType = parentType;
+    Type currentChildType = childType;
+    parentType = Type::NumberOrString;
+    auto parentParameterExtraInfo = currentParameterExtraInfo;
+    currentParameterExtraInfo = "";
+    isDirectChildOfVariableBracketAccessorNode = true;
+    node.expression->Visit(*this);
+    isDirectChildOfVariableBracketAccessorNode = false;
+    currentParameterExtraInfo = parentParameterExtraInfo;
+    parentType = currentParentType;
+    childType = currentChildType;
+
+    if (node.child) {
+      node.child->Visit(*this);
+    }
+  }
+  void OnVisitIdentifierNode(IdentifierNode& node) override {
+    isDirectChildOfVariableBracketAccessorNode = false;
+    ReportAnyError(node);
+    if (parentType == Type::String) {
+      if (!ValidateObjectVariableOrVariableOrProperty(node)) {
+        // The identifier is not a variable, so either the variable is not properly declared
+        // or it's a text without quotes.
+        RaiseUnknownIdentifierError(_("You must wrap your text inside double quotes "
+                              "(example: \"Hello world\")."),
+                            node.location);
+      }
+    }
+    else if (parentType == Type::Number) {
+      if (!ValidateObjectVariableOrVariableOrProperty(node)) {
+        // The identifier is not a variable, so the variable is not properly declared.
+        RaiseUnknownIdentifierError(_("You must enter a number."), node.location);
+      }
+    }
+    else if (parentType == Type::NumberOrString) {
+      if (!ValidateObjectVariableOrVariableOrProperty(node)) {
+        // The identifier is not a variable, so either the variable is not properly declared
+        // or it's a text without quotes.
+        RaiseUnknownIdentifierError(
+            _("You must enter a number or a text, wrapped inside double quotes (example: \"Hello world\"), or a variable name."),
+            node.location);
+      }
+    } else if (parentType == Type::Variable ||
+               parentType == Type::VariableOrProperty ||
+               parentType == Type::VariableOrPropertyOrParameter) {
+      bool isRootVariableDeclared =
+          CheckVariableExistence(node.location, node.identifierName,
+                                 !node.childIdentifierName.empty());
+      if (isRootVariableDeclared) {
+        ValidateObjectVariableOrVariableOrProperty(
+            node.identifierName, node.identifierNameLocation,
+            node.childIdentifierName, node.childIdentifierNameLocation, false);
+      }
+    } else if (parentType == Type::ObjectVariable) {
+      childType = parentType;
+      if (!rootObjectName.empty()) {
+        ValidateObjectVariableOrVariableOrProperty(
+            rootObjectName, node.identifierNameLocation, node.identifierName,
+            node.identifierNameLocation, false,
+            !node.childIdentifierName.empty());
+
+        const auto &objectsContainersList =
+            projectScopedContainers.GetObjectsContainersList();
+        auto variableExistence =
+            objectsContainersList.HasObjectOrGroupWithVariableNamed(
+                rootObjectName, node.identifierName);
+        if (variableExistence == gd::ObjectsContainersList::Exists) {
+          const auto &objectVariable =
+              objectsContainersList
+                  .GetObjectOrGroupVariablesContainer(rootObjectName)
+                  ->Get(node.identifierName);
+          if (!node.childIdentifierName.empty()) {
+            const bool isChildVariableDeclared =
+                ValidateChildVariable(objectVariable, node.childIdentifierName,
+                                      node.childIdentifierNameLocation, false);
+            if (isChildVariableDeclared) {
+              const auto &childVariable =
+                  objectVariable.GetChild(node.childIdentifierName);
+              ValidateLastChildVariable(childVariable,
+                                        node.childIdentifierNameLocation);
+            }
+          }
+        }
+        rootObjectName = "";
+      }
+    } else if (parentType != Type::Object &&
+               parentType != Type::LegacyVariable) {
+      // It can't happen.
+      RaiseTypeError(
+          _("You've entered a name, but this type was expected:") + " " + TypeToString(parentType),
+          node.location);
+      childType = parentType;
+    } else {
+      childType = parentType;
+    }
+  }
+  void OnVisitObjectFunctionNameNode(ObjectFunctionNameNode& node) override {
+    isDirectChildOfVariableBracketAccessorNode = false;
+    ReportAnyError(node);
+  }
+  void OnVisitFunctionCallNode(FunctionCallNode& node) override {
+    isDirectChildOfVariableBracketAccessorNode = false;
+    childType = ValidateFunction(node);
+  }
+  void OnVisitEmptyNode(EmptyNode& node) override {
+    ReportAnyError(node);
+    gd::String message;
+    if (parentType == Type::Number) {
+      message = _("You must enter a number or a valid expression call.");
+    } else if (parentType == Type::String) {
+      message = _(
+          "You must enter a text (between quotes) or a valid expression call.");
+    } else if (parentType == Type::Variable ||
+               parentType == Type::VariableOrProperty ||
+               parentType == Type::VariableOrPropertyOrParameter ||
+               parentType == Type::ObjectVariable ||
+               parentType == Type::LegacyVariable) {
+      message = _("You must enter a variable name.");
+    } else if (parentType == Type::Object) {
+      message = _("You must enter a valid object name.");
+    } else if (isDirectChildOfVariableBracketAccessorNode) {
+      message = _("You must enter a valid expression inside the brackets.");
+    } else {
+      // It can't happen.
+      message = _("You must enter a valid expression.");
+    }
+    RaiseTypeError(message, node.location);
+    childType = Type::Empty;
+  }
+
+private:
+  enum Type {
+    Unknown = 0,
+    Number,
+    String,
+    NumberOrString,
+    Variable,
+    ObjectVariable,
+    LegacyVariable,
+    Object,
+    Empty,
+    VariableOrProperty,
+    VariableOrPropertyOrParameter
+  };
+  Type ValidateFunction(const gd::FunctionCallNode& function);
+  bool ValidateObjectVariableOrVariableOrProperty(const gd::IdentifierNode& identifier);
+  bool ValidateObjectVariableOrVariableOrProperty(
+      const gd::String &identifierName,
+      const gd::ExpressionParserLocation identifierNameLocation,
+      const gd::String &childIdentifierName,
+      const gd::ExpressionParserLocation childIdentifierNameLocation,
+      const bool isUndeclaredVariableFatal,
+      const bool hasMoreChildren = false);
+  bool ValidateChildVariable(
+      const gd::Variable &parentVariable, const gd::String &childVariableName,
+      const gd::ExpressionParserLocation childNameLocation,
+      const bool isUndeclaredVariableFatal);
+  void ValidateLastChildVariable(
+    const gd::Variable &lastChildVariable,
+    const gd::ExpressionParserLocation childNameLocation);
+
+  bool CheckVariableExistence(const ExpressionParserLocation &location,
+                              const gd::String &name, bool hasChild) {
+    if (currentParameterExtraInfo != "AllowUndeclaredVariable") {
+      bool isRootVariableDeclared = false;
+      projectScopedContainers.MatchIdentifierWithName<void>(
+          name,
+          [&]() {
+            // This represents an object.
+            RaiseVariableNameCollisionError(
+                _("This variable has the same name as an object. Consider "
+                  "renaming one or the other."),
+                location, name);
+          },
+          [&]() {
+            // This is a variable.
+            isRootVariableDeclared = true;
+          },
+          [&]() {
+            // This is a property.
+            if (parentType != Type::VariableOrProperty &&
+                parentType != Type::VariableOrPropertyOrParameter) {
+              RaiseVariableNameCollisionError(
+                  _("This variable has the same name as a property. Consider "
+                    "renaming one or the other."),
+                  location, name);
+            } else if (hasChild) {
+              RaiseMalformedVariableParameter(
+                  _("Properties can't have children."), location, name);
+            }
+          },
+          [&]() {
+            // This is a parameter.
+            if (parentType != Type::VariableOrPropertyOrParameter) {
+              RaiseVariableNameCollisionError(
+                  _("This variable has the same name as a parameter. Consider "
+                    "renaming one or the other."),
+                  location, name);
+            } else if (hasChild) {
+              RaiseMalformedVariableParameter(
+                  _("Properties can't have children."), location, name);
+            }
+          },
+          [&]() {
+            // This is something else.
+            RaiseUndeclaredVariableError(
+                _("No variable with this name found."), location,
+                name);
+          });
+    return isRootVariableDeclared;
+    }
+    return false;
+  }
+
+  void ReportAnyError(const ExpressionNode& node, bool isFatal = true) {
+    if (node.diagnostic) {
+      // Syntax errors are holden by the AST nodes.
+      // It's fine to give pointers on them as the AST live longer than errors
+      // handling.
+      allErrors.push_back(node.diagnostic.get());
+      if (isFatal) {
+        fatalErrors.push_back(node.diagnostic.get());
+      }
+    }
+  }
+
+  void RaiseError(gd::ExpressionParserError::ErrorType type,
+                  const gd::String &message,
+                  const ExpressionParserLocation &location, bool isFatal = true,
+                  const gd::String &actualValue = "",
+                  const gd::String &objectName = "") {
+    auto diagnostic = gd::make_unique<ExpressionParserError>(
+        type, message, location, actualValue, objectName);
+    allErrors.push_back(diagnostic.get());
+    if (isFatal) {
+      fatalErrors.push_back(diagnostic.get());
+    }
+    // Errors found by the validator are not holden by the AST nodes.
+    // They must be owned by the validator to keep living while errors are
+    // handled by the caller.
+    supplementalErrors.push_back(std::move(diagnostic));
+  }
+
+  void RaiseUnknownIdentifierError(const gd::String &message,
+                                   const ExpressionParserLocation &location) {
+    RaiseError(gd::ExpressionParserError::ErrorType::UnknownIdentifier, message,
+               location);
+  }
+
+  void RaiseUndeclaredVariableError(const gd::String &message,
+                                    const ExpressionParserLocation &location,
+                                    const gd::String &variableName,
+                                    const gd::String &objectName = "",
+                                    const bool isUndeclaredVariableFatal = true) {
+    RaiseError(gd::ExpressionParserError::ErrorType::UndeclaredVariable,
+               message, location, isUndeclaredVariableFatal, variableName, objectName);
+  }
+
+  void RaiseVariableNameCollisionError(const gd::String &message,
+                                    const ExpressionParserLocation &location,
+                                    const gd::String &variableName,
+                                    const gd::String &objectName = "") {
+    RaiseError(gd::ExpressionParserError::ErrorType::VariableNameCollision,
+               message, location, false, variableName, objectName);
+  }
+
+  void RaiseMalformedVariableParameter(const gd::String &message,
+                                   const ExpressionParserLocation &location,
+                                   const gd::String &variableName) {
+    RaiseError(gd::ExpressionParserError::ErrorType::MalformedVariableParameter,
+               message, location, true, variableName, "");
+  }
+
+  void RaiseTypeError(const gd::String &message,
+                      const ExpressionParserLocation &location,
+                      bool isFatal = true) {
+    RaiseError(gd::ExpressionParserError::ErrorType::MismatchedType, message,
+               location, isFatal);
+  }
+
+  void RaiseOperatorError(const gd::String &message,
+                          const ExpressionParserLocation &location) {
+    RaiseError(gd::ExpressionParserError::ErrorType::InvalidOperator, message,
+               location);
+  }
+
+  void ReadChildTypeFromVariable(gd::Variable::Type variableType) {
+    if (variableType == gd::Variable::Number) {
+      childType = Type::Number;
+    } else if (variableType == gd::Variable::String) {
+      childType = Type::String;
+    } else {
+      // Nothing - we don't know the precise type (this could be used as a string or as a number).
+    }
+  }
+
+  static bool ShouldTypeBeRefined(Type type) {
+    return (type == Type::Unknown || type == Type::NumberOrString);
+  }
+
+  static Type StringToType(const gd::String &type);
+  static const gd::String &TypeToString(Type type);
+  static const gd::String unknownTypeString;
+  static const gd::String numberTypeString;
+  static const gd::String stringTypeString;
+  static const gd::String numberOrStringTypeString;
+  static const gd::String variableTypeString;
+  static const gd::String legacyVariableTypeString;
+  static const gd::String objectTypeString;
+  static const gd::String identifierTypeString;
+  static const gd::String emptyTypeString;
+  // Used as the default for the `extraInfo_` constructor argument: a long-lived
+  // empty string, so that storing &extraInfo_ in currentParameterExtraInfo
+  // never dangles when no explicit extraInfo is provided.
+  static const gd::String emptyParameterExtraInfo;
+
+  std::vector<ExpressionParserError*> fatalErrors;
+  std::vector<ExpressionParserError*> allErrors;
+  std::vector<ExpressionParserError*> deprecationWarnings;
+  std::vector<std::unique_ptr<ExpressionParserError>> supplementalErrors;
+  Type childType; ///< The type "discovered" down the tree and passed up.
+  Type parentType; ///< The type "required" by the top of the tree.
+  /** The root object name of the expression or a function call. */
+  gd::String rootObjectName;
+  bool forbidsUsageOfBracketsBecauseParentIsObject;
+  gd::String variableObjectName;
+  gd::ExpressionParserLocation variableObjectNameLocation;
+  const gd::Variable *parentVariable = nullptr;
+  size_t variableChildDepth = 0;
+  gd::String currentParameterExtraInfo;
+  bool isDirectChildOfVariableBracketAccessorNode = false;
+  const gd::Platform &platform;
+  const gd::ProjectScopedContainers &projectScopedContainers;
+};
+
+}  // namespace gd
+

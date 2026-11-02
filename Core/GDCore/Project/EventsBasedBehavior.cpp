@@ -1,0 +1,54 @@
+/*
+ * GDevelop Core
+ * Copyright 2008-2016 Florian Rival (Florian.Rival@gmail.com). All rights
+ * reserved. This project is released under the MIT License.
+ */
+#include "EventsBasedBehavior.h"
+
+#include "EventsFunctionsContainer.h"
+#include "GDCore/Serialization/SerializerElement.h"
+#include "GDCore/Tools/MakeUnique.h"
+
+namespace gd {
+
+EventsBasedBehavior::EventsBasedBehavior()
+    : AbstractEventsBasedEntity(
+          "MyBehavior", gd::EventsFunctionsContainer::FunctionOwner::Behavior),
+      sharedPropertyDescriptors(
+          gd::EventsFunctionsContainer::FunctionOwner::Behavior) {}
+
+void EventsBasedBehavior::SerializeTo(SerializerElement& element) const {
+  AbstractEventsBasedEntity::SerializeTo(element);
+  element.SetAttribute("objectType", objectType);
+  if (!isSynchronizedOverNetworkByDefault) {
+    element.SetBoolAttribute("isSynchronizedOverNetworkByDefault", false);
+  }
+  if (!sharedPropertyDescriptors.empty()) {
+    sharedPropertyDescriptors.SerializeElementsTo(
+        "propertyDescriptor", element.AddChild("sharedPropertyDescriptors"));
+    sharedPropertyDescriptors.SerializeFoldersTo(
+        element.AddChild("sharedPropertiesFolderStructure"));
+  }
+}
+
+void EventsBasedBehavior::UnserializeFrom(gd::Project& project,
+                                          const SerializerElement& element) {
+  AbstractEventsBasedEntity::UnserializeFrom(project, element);
+  objectType = element.GetStringAttribute("objectType");
+  isSynchronizedOverNetworkByDefault =
+      element.GetBoolAttribute("isSynchronizedOverNetworkByDefault", true);
+  // Shared properties are only serialized when there are some.
+  sharedPropertyDescriptors.UnserializeElementsFrom(
+      "propertyDescriptor", element.HasChild("sharedPropertyDescriptors")
+                                ? element.GetChild("sharedPropertyDescriptors")
+                                : SerializerElement());
+  if (element.HasChild("sharedPropertiesFolderStructure")) {
+    sharedPropertyDescriptors.UnserializeFoldersFrom(
+        project, element.GetChild("sharedPropertiesFolderStructure", 0));
+  }
+  // Compatibility with GD <= 5.6.251
+  sharedPropertyDescriptors.AddMissingPropertiesInRootFolder();
+  // end of compatibility code
+}
+
+}  // namespace gd

@@ -1,0 +1,1022 @@
+// @flow
+import posthog from 'posthog-js';
+import { getUserUUID, resetUserUUID } from './UserUUID';
+import { type AuthenticatedUser } from '../../Profile/AuthenticatedUserContext';
+import { User as FirebaseUser } from 'firebase/auth';
+import {
+  countDailyAggregatedEventOccurrence,
+  getProgramOpeningCount,
+  incrementProgramOpeningCount,
+} from './LocalStats';
+import { getIDEVersion, getIDEVersionWithHash } from '../../Version';
+import { loadPreferencesFromLocalStorage } from '../../MainFrame/Preferences/PreferencesProvider';
+import { getBrowserLanguageOrLocale } from '../Language';
+import { type SubscriptionAnalyticsMetadata } from '../../Profile/Subscription/SubscriptionContext';
+import optionalRequire from '../OptionalRequire';
+import Window from '../Window';
+import {
+  isMobile,
+  isNativeMobileApp,
+  isNativeIos,
+  isNativeAndroid,
+} from '../Platform';
+import { retryIfFailed } from '../RetryIfFailed';
+import { type NewProjectCreationSource } from '../../ProjectCreation/NewProjectSetupDialog';
+import { isServiceWorkerSupported } from '../../ServiceWorkerSetup';
+const electron = optionalRequire('electron');
+
+const isElectronApp = !!electron;
+const isDev = Window.isDev();
+
+// Flag helpful to know if posthog is ready to send events.
+let posthogLoaded = false;
+// Flag helpful to know if the user has been identified, to avoid sending initial events
+// to a random uuid (like program_opening), which may not be merged to the main user's account.
+let userIdentified = false;
+let currentlyRunningInAppTutorial = null;
+let currentProjectUuid: string | null = null;
+
+const lastUserIdAndPropertiesSentLocalStorageKey =
+  'gd-analytics-last-user-id-and-properties-sent';
+
+const loadLastUserIdAndPropertiesSent = (): ?string => {
+  try {
+    return localStorage.getItem(lastUserIdAndPropertiesSentLocalStorageKey);
+  } catch (e) {
+    console.warn('Unable to load the last user properties sent', e);
+  }
+
+  return null;
+};
+
+const saveLastUserIdAndPropertiesSent = (userIdAndProperties: string) => {
+  try {
+    localStorage.setItem(
+      lastUserIdAndPropertiesSentLocalStorageKey,
+      userIdAndProperties
+    );
+  } catch (e) {
+    console.warn('Unable to store the last user properties sent', e);
+  }
+};
+
+let gdevelopEditorAnalytics: {|
+  initialize: (rootElement: HTMLElement) => Promise<void>,
+  identify: (
+    userId: string,
+    userProperties: { [string]: any }
+  ) => Promise<void>,
+  trackEvent: (eventName: string, metadata: { [string]: any }) => Promise<void>,
+|} | null = null;
+let gdevelopEditorAnalyticsPromise: Promise<void> | null = null;
+
+const ensureGDevelopEditorAnalyticsReady = async () => {
+  if (gdevelopEditorAnalytics) {
+    // Already loaded.
+    return;
+  }
+
+  if (gdevelopEditorAnalyticsPromise) {
+    // Being loaded.
+    return gdevelopEditorAnalyticsPromise;
+  }
+
+  gdevelopEditorAnalyticsPromise = (async () => {
+    try {
+      // Load the library. If it fails, retry or throw so we can retry later.
+      const module = await retryIfFailed(
+        { times: 2 },
+        async () =>
+          // $FlowFixMe[incompatible-type] - Remote script cannot be found.
+          // $FlowFixMe[cannot-resolve-module]
+          (await import(/* webpackIgnore: true */ 'https://resources.gdevelop.io/a/gea.js'))
+            .default
+      );
+      if (module) {
+        await module.initialize({
+          documentBody: document.body,
+          isNativeMobileApp: isNativeMobileApp(),
+          isElectronApp,
+          isDev,
+          isMobile: isMobile(),
+          ideVersionWithHash: getIDEVersionWithHash(),
+        });
+        gdevelopEditorAnalytics = module;
+      }
+    } catch (error) {
+      console.error('Error while loading GDevelop Editor Analytics:', error);
+    } finally {
+      // If loading fails, retry later.
+      gdevelopEditorAnalyticsPromise = null;
+    }
+  })();
+
+  return gdevelopEditorAnalyticsPromise;
+};
+
+export const setCurrentlyRunningInAppTutorial = (
+  tutorial: string | null
+): string | null => (currentlyRunningInAppTutorial = tutorial);
+
+export const setCurrentProjectUuid = (projectUuid: string | null) => {
+  currentProjectUuid = projectUuid;
+};
+
+const makeCanSendEvent = (options: {| minimumTimeBetweenEvents: number |}) => {
+  const lastSentEventTimestamps = {};
+  return (eventName: string) => {
+    const now = Date.now();
+    // $FlowFixMe[invalid-computed-prop]
+    if (lastSentEventTimestamps[eventName]) {
+      const timeSinceLastEvent = now - lastSentEventTimestamps[eventName];
+      if (timeSinceLastEvent < options.minimumTimeBetweenEvents) {
+        return false;
+      }
+    }
+    // $FlowFixMe[prop-missing]
+    lastSentEventTimestamps[eventName] = now;
+    return true;
+  };
+};
+
+/**
+ * Metadata about the app, added to every event. Note that `appKind` is `mobile-app` for both
+ * iOS and Android: use `appPlatform` to tell them apart.
+ */
+const getAppMetadata = () => ({
+  isInAppTutorialRunning: currentlyRunningInAppTutorial,
+  currentProjectUuid,
+  isInDesktopApp: isElectronApp,
+  isInWebApp: !isElectronApp && !isNativeMobileApp(),
+  isInNativeMobileApp: isNativeMobileApp(),
+  isInNativeIosApp: isNativeIos(),
+  isInNativeAndroidApp: isNativeAndroid(),
+  appKind: isElectronApp
+    ? 'desktop-app'
+    : isNativeMobileApp()
+    ? 'mobile-app'
+    : 'web-app',
+  appPlatform: isNativeIos()
+    ? 'ios'
+    : isNativeAndroid()
+    ? 'android'
+    : isElectronApp
+    ? 'desktop'
+    : 'web',
+  appVersion: getIDEVersion(),
+  appVersionWithHash: getIDEVersionWithHash(),
+  serviceWorkerSupported: isServiceWorkerSupported(),
+});
+
+/**
+ * Used to send an event to the analytics.
+ * This function will retry to send the event if the analytics service is not ready.
+ */
+const recordEvent = (
+  name: string,
+  metadata?: { [string]: any },
+  appMetadata: { [string]: any } = getAppMetadata()
+) => {
+  if (isDev) {
+    // Uncomment to inspect analytics in development.
+    // console.log(`Should have sent analytics event "${name}"`, metadata);
+    return;
+  }
+
+  (() => {
+    if (!posthogLoaded || !userIdentified) {
+      console.info(`App analytics not ready for an event - retrying in 2s.`);
+      setTimeout(() => {
+        console.info(
+          `Retrying to send the app analytics event with name ${name}`
+        );
+        recordEvent(name, metadata, appMetadata);
+      }, 2000);
+
+      return;
+    }
+
+    posthog.capture(name, {
+      ...metadata,
+      ...appMetadata,
+    });
+  })();
+
+  (async () => {
+    await ensureGDevelopEditorAnalyticsReady();
+    if (gdevelopEditorAnalytics) {
+      await gdevelopEditorAnalytics.trackEvent(name, {
+        ...metadata,
+        ...appMetadata,
+      });
+    }
+  })();
+};
+
+/**
+ * Used to send an event at most once per day (UTC), for events happening often: each
+ * occurrence costs one analytics event otherwise.
+ * The sent event has a `countSinceLastSent` property with the number of occurrences since
+ * the last time it was sent (the occurrences of the day are reported by the next sent one),
+ * so the total number of occurrences is the sum of this property.
+ */
+const recordDailyAggregatedEvent = (
+  name: string,
+  metadata?: { [string]: any },
+  aggregationKey?: string
+) => {
+  const countSinceLastSent = countDailyAggregatedEventOccurrence(
+    aggregationKey || name
+  );
+  if (countSinceLastSent === null) return;
+
+  recordEvent(name, { ...metadata, countSinceLastSent });
+};
+
+/**
+ * Used once at the beginning of the app to initialize the analytics.
+ */
+export const installAnalyticsEvents = () => {
+  if (isDev) {
+    console.info('Development build - Analytics disabled');
+    return;
+  }
+
+  ensureGDevelopEditorAnalyticsReady().catch(() => {
+    // Will be retried when an event is sent.
+  });
+
+  posthog.init('phc_yjTVz4BMHUOhCLBhVImjk3Jn1AjMCg808bxENY228qu', {
+    api_host: 'https://app.posthog.com',
+    loaded: () => {
+      posthogLoaded = true;
+    },
+    autocapture: false, // we disable autocapture because we want to control which events we send.
+    // The app is opened once per session and `program_opening` is already sent:
+    // page views would be redundant events.
+    capture_pageview: false,
+    capture_pageleave: false,
+    // When nothing is stored by PostHog yet (first launch), use the anonymous UUID
+    // as the PostHog anonymous id: identifying the anonymous user with it then
+    // does not require an `$identify` event.
+    get_device_id: () => getUserUUID(),
+    session_recording: {
+      // Iframes (in-game editor, gameplay tests) are not recorded: the recording would
+      // keep a reference to every document loaded in them (including game WebAssembly memories).
+      blockSelector: 'iframe',
+    },
+  });
+};
+
+/**
+ * Must be called every time the user is fetched (and also even if the user turns out to be not connected).
+ * This allows updating the user properties (like the language used, the version of the app, etc...)
+ * and to identify the user if not already done.
+ * We can safely call it multiple times, as it will only send the user properties if they changed.
+ */
+export const identifyUserForAnalytics = (
+  authenticatedUser: AuthenticatedUser
+) => {
+  if (isDev) {
+    console.info('Development build - Analytics disabled');
+    return;
+  }
+
+  const firebaseUser = authenticatedUser.firebaseUser;
+  const profile = authenticatedUser.profile;
+  const userPreferences = loadPreferencesFromLocalStorage();
+  const appLanguage = userPreferences ? userPreferences.language : undefined;
+  const browserLanguage = getBrowserLanguageOrLocale();
+
+  const userProperties = {
+    providerId: firebaseUser ? firebaseUser.providerId : undefined,
+    email: firebaseUser ? firebaseUser.email : undefined,
+    emailVerified: firebaseUser ? firebaseUser.emailVerified : undefined,
+    // Only keep information useful to generate app usage statistics:
+    uuid: getUserUUID(),
+    version: getIDEVersion(),
+    versionWithHash: getIDEVersionWithHash(),
+    appLanguage,
+    browserLanguage,
+    themeName: userPreferences ? userPreferences.themeName : 'Unknown',
+    ...(isElectronApp ? { usedDesktopApp: true } : { usedWebApp: true }),
+    // Additional profile information:
+    gdevelopUsage: profile ? profile.gdevelopUsage : undefined,
+    teamOrCompanySize: profile ? profile.teamOrCompanySize : undefined,
+    companyName: profile ? profile.companyName : undefined,
+    creationExperience: profile ? profile.creationExperience : undefined,
+    creationGoal: profile ? profile.creationGoal : undefined,
+    hearFrom: profile ? profile.hearFrom : undefined,
+  };
+
+  // If the user is not logged in, identify the user by its anonymous UUID.
+  // If the user is logged in, identify the user by its Firebase ID.
+  const userId = firebaseUser ? firebaseUser.uid : getUserUUID();
+
+  (() => {
+    if (!posthogLoaded) {
+      console.info(`App analytics not ready - retrying in 2s.`);
+      setTimeout(() => {
+        console.info(`Retrying to update the user for app analytics.`);
+        identifyUserForAnalytics(authenticatedUser);
+      }, 2000);
+
+      return;
+    }
+
+    // Identify which user is using the app, only if the user or its properties
+    // changed since they were last sent (even in a previous launch of the app):
+    // each call sends an `$identify` or `$set` event otherwise.
+    // This is so we can build stats on the used version, languages and usage
+    // of GDevelop features.
+    const userIdAndProperties = JSON.stringify({ userId, userProperties });
+    if (
+      posthog.get_distinct_id() !== userId ||
+      userIdAndProperties !== loadLastUserIdAndPropertiesSent()
+    ) {
+      posthog.identify(userId, userProperties);
+      saveLastUserIdAndPropertiesSent(userIdAndProperties);
+    }
+    userIdentified = true;
+  })();
+
+  (async () => {
+    await ensureGDevelopEditorAnalyticsReady();
+    if (gdevelopEditorAnalytics) {
+      await gdevelopEditorAnalytics.identify(userId, userProperties);
+    }
+  })();
+};
+
+/**
+ * Must be called on signup, to link the current user Firebase ID to the anonymous UUID
+ * that was used before the signup (this allows linking the events sent before the signup)
+ * This is only done on signup as an ID can only be an alias of another ID once.
+ */
+export const aliasUserForAnalyticsAfterSignUp = (
+  // $FlowFixMe[value-as-type]
+  firebaseUser: FirebaseUser
+) => {
+  if (isDev) {
+    console.info('Development build - Analytics disabled');
+    return;
+  }
+
+  if (!posthogLoaded) {
+    console.info(`App analytics not ready for aliasing - retrying in 2s.`);
+    setTimeout(() => {
+      console.info(`Retrying to alias the user for app analytics.`);
+      aliasUserForAnalyticsAfterSignUp(firebaseUser);
+    }, 2000);
+
+    return;
+  }
+
+  // This indicates to Posthog that the current user Firebase ID is now an alias
+  // of the anonymous UUID that was used before the signup.
+  posthog.alias(firebaseUser.uid, getUserUUID());
+};
+
+export const onUserLogoutForAnalytics = () => {
+  if (isDev) {
+    console.info('Development build - Analytics disabled');
+    return;
+  }
+
+  // Reset the UUID to generate a random new one and be sure
+  // we don't count different users as a single one in our stats.
+  resetUserUUID();
+  posthog.reset();
+};
+
+export const sendProgramOpening = () => {
+  incrementProgramOpeningCount();
+  recordDailyAggregatedEvent('program_opening', {
+    $set: { programOpeningCount: getProgramOpeningCount() },
+  });
+};
+
+export const sendExportLaunched = (exportKind: string) => {
+  recordEvent('export_launched', {
+    platform: 'GDevelop JS Platform', // Hardcoded here for now
+    exportKind,
+  });
+};
+
+export const sendGameDetailsOpened = (options: {
+  from: 'profile' | 'homepage' | 'projectManager',
+}) => {
+  recordEvent('game_details_opened', options);
+};
+
+export const sendExampleDetailsOpened = (slug: string) => {
+  recordEvent('example-details-opened', { slug });
+};
+
+export const sendNewGameCreated = ({
+  exampleUrl,
+  exampleSlug,
+  exampleCompositeSlug,
+  creationSource,
+  projectUuid,
+}: {|
+  exampleUrl: string,
+  exampleSlug: string,
+  exampleCompositeSlug: string,
+  creationSource: NewProjectCreationSource,
+  projectUuid: string,
+|}) => {
+  recordEvent('new_game_creation', {
+    platform: 'GDevelop JS Platform', // Hardcoded here for now
+    templateName: exampleUrl,
+    exampleSlug,
+    exampleCompositeSlug,
+    creationSource,
+    projectUuid,
+  });
+};
+
+export const sendProjectOpened = (metadata: {|
+  projectUuid: string,
+  storageProviderName: string,
+  // Milliseconds since the project file was last modified, if known. Lets analytics
+  // distinguish "came back after a long time" from "reopened right away". Null when
+  // the storage provider does not expose a last-modified date.
+  timeSinceLastModified: number | null,
+|}) => {
+  // Sent once a day per project, so that the projects (and so the templates
+  // they were created from) that are opened again can still be known.
+  recordDailyAggregatedEvent(
+    'project-opened',
+    metadata,
+    `project-opened-${metadata.projectUuid}`
+  );
+};
+
+export const sendTutorialOpened = (tutorialName: string) => {
+  recordEvent('tutorial_opened', {
+    tutorialName,
+  });
+};
+
+export const sendInAppTutorialStarted = (metadata: {|
+  tutorialId: string,
+  scenario: 'startOver' | 'resume' | 'start',
+  isUIRestricted: boolean,
+|}) => {
+  recordEvent('in-app-tutorial-started', metadata);
+};
+
+export const sendInAppTutorialExited = (metadata: {|
+  tutorialId: string,
+  reason: 'completed' | 'user-early-exit',
+  isUIRestricted: boolean,
+|}) => {
+  recordEvent('in-app-tutorial-exited', metadata);
+};
+
+const patchWithCurrencyField = (options: { [string]: any }) => {
+  return {
+    ...options,
+    currency: options.priceCurrency,
+  };
+};
+
+export const sendAssetPackOpened = (options: {|
+  assetPackId: string | null,
+  assetPackName: string,
+  assetPackTag: string | null,
+  assetPackKind: 'public' | 'private' | 'unknown',
+  source: 'store-home' | 'author-profile' | 'new-object',
+|}) => {
+  // Sent once a day per asset pack, so that asset packs can be compared.
+  recordDailyAggregatedEvent(
+    'asset_pack_opened',
+    options,
+    `asset_pack_opened-${options.assetPackId ||
+      options.assetPackTag ||
+      options.assetPackName}`
+  );
+};
+
+export const sendAssetPackBuyClicked = (options: {|
+  assetPackId: string,
+  assetPackName: string,
+  assetPackTag: string,
+  assetPackKind: 'public' | 'private' | 'unknown',
+  priceValue: number | void,
+  priceCurrency: string | void,
+  usageType: string,
+|}) => {
+  recordEvent('asset_pack_buy_clicked', patchWithCurrencyField(options));
+};
+
+export const sendAssetPackInformationOpened = (options: {|
+  assetPackId: string,
+  assetPackName: string,
+  assetPackKind: 'public' | 'private' | 'unknown',
+  priceValue: number | void,
+  priceCurrency: string | void,
+|}) => {
+  recordEvent('asset_pack_information_opened', patchWithCurrencyField(options));
+};
+
+export const sendGameTemplateBuyClicked = (options: {|
+  gameTemplateId: string,
+  gameTemplateName: string,
+  gameTemplateTag: string,
+  usageType: string,
+  priceValue: number | void,
+  priceCurrency: string | void,
+|}) => {
+  recordEvent('game_template_buy_clicked', patchWithCurrencyField(options));
+};
+
+export const sendGameTemplateInformationOpened = (options: {|
+  gameTemplateId: string,
+  gameTemplateName: string,
+  source: 'store' | 'examples-list' | 'homepage' | 'web-link',
+  priceValue: number | void,
+  priceCurrency: string | void,
+|}) => {
+  recordEvent(
+    'game_template_information_opened',
+    patchWithCurrencyField(options)
+  );
+};
+
+export const sendBundleBuyClicked = (options: {|
+  bundleId: string,
+  bundleName: string,
+  bundleTag: string,
+  usageType: string,
+  priceValue: number | void,
+  priceCurrency: string | void,
+|}) => {
+  recordEvent('bundle_buy_clicked', patchWithCurrencyField(options));
+};
+export const sendBundleInformationOpened = (options: {|
+  bundleId: string,
+  bundleName: string,
+  source: 'store' | 'learn' | 'web-link',
+  priceValue: number | void,
+  priceCurrency: string | void,
+|}) => {
+  recordEvent('bundle_information_opened', patchWithCurrencyField(options));
+};
+
+export const sendCourseInformationOpened = (options: {|
+  courseId: string,
+  courseName: string,
+  source: 'store' | 'learn',
+  priceValue: number | void,
+  priceCurrency: string | void,
+|}) => {
+  recordEvent('course_information_opened', patchWithCurrencyField(options));
+};
+
+export const sendCourseBuyClicked = (options: {|
+  courseId: string,
+  courseName: string,
+  usageType: string,
+  priceValue: number | void,
+  priceCurrency: string | void,
+|}) => {
+  recordEvent('course_buy_clicked', patchWithCurrencyField(options));
+};
+
+export const sendUserSurveyStarted = () => {
+  recordEvent('user_survey_started');
+};
+export const sendUserSurveyCompleted = () => {
+  recordEvent('user_survey_completed');
+};
+export const sendUserSurveyHidden = () => {
+  recordEvent('user_survey_hidden');
+};
+
+export const sendHelpSearch = (searchText: string) => {
+  recordEvent('help_search', {
+    searchText,
+  });
+};
+
+export const sendErrorMessage = (
+  message: string,
+  type:
+    | 'error'
+    | 'error-boundary_mainframe'
+    | 'error-boundary_list-search-result'
+    | 'error-boundary_box-search-result'
+    | 'error-boundary_app'
+    | 'error-boundary_extension-loader',
+  rawError: any,
+  errorId: string
+) => {
+  recordEvent('error_message', {
+    message,
+    type,
+    rawError,
+    errorId,
+  });
+};
+
+/**
+ * Sent when the editor starts again after the previous session was interrupted (on mobile,
+ * when the system killed the WebView or the app: see NativeAppLifecycle.js).
+ */
+export const sendNativeAppRestart = (metadata: { [string]: any }) => {
+  recordEvent('native-app-restart', metadata);
+};
+
+/** Sent when the system warns the app that it's running low on memory. */
+export const sendNativeAppMemoryWarning = (metadata: { [string]: any }) => {
+  recordEvent('native-app-memory-warning', metadata);
+};
+
+export const sendSignupDone = (email: string) => {
+  recordEvent('signup', {
+    email,
+  });
+};
+
+export const sendSubscriptionCheckDialogShown = ({
+  mode,
+  id,
+}: {|
+  mode: string,
+  id: string,
+|}) => {
+  recordEvent('subscription-check-dialog-shown', {
+    mode,
+    title: id,
+  });
+};
+
+export const sendSubscriptionCheckDismiss = () => {
+  recordEvent('subscription-check-dialog-dismiss');
+};
+
+export type SubscriptionDialogDisplayReason =
+  | 'Disable GDevelop splash at startup'
+  | 'Debugger'
+  | 'Hot reloading'
+  | 'Preview over wifi'
+  | 'Landing dialog at opening'
+  | 'Leaderboard count per game limit reached'
+  | 'Cloud Project limit reached'
+  | 'Consult profile'
+  | 'Build limit reached'
+  | 'Leaderboard customization'
+  | 'Generate project from prompt'
+  | 'Version history'
+  | 'Add collaborators on project'
+  | 'Claim asset pack'
+  | 'Callout in Classroom tab'
+  | 'Unlock build type'
+  | 'Manage subscription as teacher'
+  | 'Unlock course chapter'
+  | 'Account get premium'
+  | 'AI requests (subscribe)'
+  | 'AI requests (upgrade)'
+  | 'AI requests history'
+  | 'Coupon code entered'
+  | 'Restore deleted project';
+
+export type SubscriptionPlacementId =
+  | 'builds'
+  | 'debugger'
+  | 'gdevelop-branding'
+  | 'generate-from-prompt'
+  | 'hot-reloading'
+  | 'leaderboards-customization'
+  | 'leaderboards'
+  | 'max-projects-reached'
+  | 'opening-from-link'
+  | 'preview-wifi'
+  | 'profile'
+  | 'invite-collaborators'
+  | 'version-history'
+  | 'claim-asset-pack'
+  | 'unlock-course-chapter'
+  | 'account-get-premium'
+  | 'education'
+  | 'ai-requests'
+  | 'redeem-code'
+  | 'restore-deleted-project';
+
+export const sendSubscriptionDialogShown = (
+  metadata: SubscriptionAnalyticsMetadata
+) => {
+  recordEvent('subscription-dialog-shown', metadata);
+};
+
+export const sendAssetOpened = (options: {|
+  id: string,
+  name: string,
+  assetPackName: string | null,
+  assetPackTag: string | null,
+  assetPackId: string | null,
+  assetPackKind: 'public' | 'private' | 'unknown',
+|}) => {
+  recordDailyAggregatedEvent('asset-opened', options);
+};
+
+export const sendAssetAddedToProject = (options: {|
+  id: string,
+  name: string,
+  assetPackName: string | null,
+  assetPackTag: string | null,
+  assetPackId: string | null,
+  assetPackKind: 'public' | 'private' | 'unknown',
+|}) => {
+  recordDailyAggregatedEvent('asset-added-to-project', options);
+};
+
+export const sendExtensionDetailsOpened = (name: string) => {
+  recordEvent('extension-details-opened', { name });
+};
+
+export const sendExtensionAddedToProject = (name: string) => {
+  // Sent once a day per extension, so that extensions can be compared.
+  recordDailyAggregatedEvent(
+    'extension-added-to-project',
+    { name },
+    `extension-added-to-project-${name}`
+  );
+};
+
+export const sendNewObjectCreated = (name: string) => {
+  recordDailyAggregatedEvent('new-object-created', { name });
+};
+
+export const sendShowcaseGameLinkOpened = (title: string, linkType: string) => {
+  recordEvent('showcase-open-game-link', { title, linkType });
+};
+
+export const sendChoosePlanClicked = (metadata: {|
+  planId: string | null,
+  pricingSystemId: string | null,
+  dialogVariant?: string,
+|}) => {
+  recordEvent('choose-plan-click', metadata);
+};
+
+export const sendCancelSubscriptionToChange = (metadata: {|
+  planId: string,
+  pricingSystemId: string | null,
+|}) => {
+  recordEvent('cancel-subscription-to-change', metadata);
+};
+
+export const sendExternalEditorOpened = (editorName: string) => {
+  recordDailyAggregatedEvent(
+    'open_external_editor',
+    { editorName },
+    `open_external_editor-${editorName}`
+  );
+};
+
+export const sendBehaviorsEditorShown = (metadata: {|
+  parentEditor: 'object-editor-dialog',
+|}) => {
+  // It would be costly to send an event for each opening of the behaviors editor.
+  // We would rather have this aggregated by the app and sent as a property for the user.
+  // TODO: investigate a more generic way of collecting some useful counters to understand
+  // which editors are used (and how much/how long),
+  // and send these as properties in the `identify` event (or in a debounced event?).
+  // recordEvent('behaviors-editor-shown', metadata);
+};
+
+export const sendBehaviorAdded = (metadata: {|
+  behaviorType: string,
+  parentEditor: 'behaviors-editor' | 'instruction-editor-dialog',
+|}) => {
+  // Sent once a day per behavior type, so that behaviors can be compared.
+  recordDailyAggregatedEvent(
+    'behavior-added',
+    metadata,
+    `behavior-added-${metadata.behaviorType}`
+  );
+};
+
+export const sendCloudProjectCouldNotBeOpened = (metadata: {|
+  userId: string,
+  cloudProjectId: string,
+|}) => {
+  recordEvent('cloud-project-opening-failed', metadata);
+};
+
+export const sendEventsExtractedAsFunction = (metadata: {|
+  step: 'begin' | 'end',
+  parentEditor:
+    | 'scene-events-editor'
+    | 'extension-events-editor'
+    | 'external-events-editor',
+|}) => {
+  recordEvent('events-extracted-as-function', metadata);
+};
+
+export const sendPreviewStarted = (metadata: {|
+  projectUuid: string,
+  networkPreview: boolean,
+  numberOfWindows: number,
+  hotReload: boolean,
+  projectDataOnlyExport: boolean,
+  fullLoadingScreen: boolean,
+  forceDiagnosticReport: boolean,
+  previewLaunchDuration: number,
+|}) => {
+  // Sent once a day per preview kind.
+  recordDailyAggregatedEvent(
+    'preview-started',
+    metadata,
+    `preview-started-${JSON.stringify({
+      networkPreview: metadata.networkPreview,
+      hotReload: metadata.hotReload,
+      projectDataOnlyExport: metadata.projectDataOnlyExport,
+      fullLoadingScreen: metadata.fullLoadingScreen,
+      forceDiagnosticReport: metadata.forceDiagnosticReport,
+    })}`
+  );
+};
+
+export const sendSocialFollowUpdated = (
+  achievementId: string,
+  metadata: {| code: string |}
+) => {
+  recordEvent(`${achievementId}-updated`, metadata);
+};
+
+const inAppTutorialProgressLastFiredEvents: {
+  [string]: {
+    lastStep: number,
+    nextCheckTimeoutId: TimeoutID | null,
+  },
+} = {};
+
+/**
+ * Register the progress of a tutorial.
+ *
+ * To avoid sending too many events, we only send tutorial progress analytics events
+ * when some steps are reached, when the tutorial is completed,
+ * or after some inactivity (more than 90 seconds).
+ */
+export const sendInAppTutorialProgress = ({
+  step,
+  tutorialId,
+  isCompleted,
+  isUIRestricted,
+}: {|
+  tutorialId: string,
+  step: number,
+  isCompleted: boolean,
+  isUIRestricted: boolean,
+|}) => {
+  const immediatelyRecordEvent = (
+    spentMoreThan90SecondsSinceLastStep: ?boolean
+  ) => {
+    // Remember the last step we sent an event for.
+    inAppTutorialProgressLastFiredEvents[tutorialId] = {
+      lastStep: step,
+      nextCheckTimeoutId: null,
+    };
+    recordEvent('in-app-tutorial-external', {
+      tutorialId,
+      step,
+      isCompleted,
+      isUIRestricted,
+      spentMoreThan90SecondsSinceLastStep: !!spentMoreThan90SecondsSinceLastStep,
+    });
+
+    if (isCompleted) {
+      recordEvent('in-app-tutorial-completed', {
+        tutorialId,
+        step,
+        isUIRestricted,
+      });
+    }
+  };
+
+  // We receive a new progress event, so we can clear the timeout used
+  // to send the last event in case there is no progress.
+  const lastFiredEvent = inAppTutorialProgressLastFiredEvents[tutorialId];
+  if (lastFiredEvent && lastFiredEvent.nextCheckTimeoutId !== null)
+    clearTimeout(lastFiredEvent.nextCheckTimeoutId);
+
+  // Immediately send the event if the tutorial is ended or it's the first progress.
+  if (isCompleted || !lastFiredEvent) {
+    immediatelyRecordEvent();
+    return;
+  }
+
+  // For long tutorials:
+  // send an event every 30 steps, or if we had more than 30 steps since the last event.
+  // This last point is important because some steps might be hidden/skipped.
+  if (step % 30 === 0 || step >= lastFiredEvent.lastStep + 30) {
+    immediatelyRecordEvent();
+    return;
+  }
+
+  // Otherwise, continue to remember the last step that was sent, and force to send it 90 seconds
+  // later if there was no more progress.
+  inAppTutorialProgressLastFiredEvents[tutorialId] = {
+    lastStep: lastFiredEvent.lastStep,
+    nextCheckTimeoutId: setTimeout(() => immediatelyRecordEvent(true), 90000),
+  };
+};
+
+export const sendAssetSwapStart = ({
+  originalObjectName,
+  objectType,
+}: {|
+  originalObjectName: string,
+  objectType: string,
+|}) => {
+  // Sent once a day per swapped object, so that swaps can be compared.
+  recordDailyAggregatedEvent(
+    'asset-swap-start',
+    {
+      originalObjectName,
+      objectType,
+    },
+    `asset-swap-start-${JSON.stringify({ objectType, originalObjectName })}`
+  );
+};
+
+export const sendAssetSwapFinished = ({
+  originalObjectName,
+  newObjectName,
+  objectType,
+}: {|
+  originalObjectName: string,
+  newObjectName: string,
+  objectType: string,
+|}) => {
+  // Sent once a day per swapped object, so that swaps can be compared.
+  recordDailyAggregatedEvent(
+    'asset-swap-finished',
+    {
+      originalObjectName,
+      newObjectName,
+      objectType,
+    },
+    `asset-swap-finished-${JSON.stringify({ objectType, originalObjectName })}`
+  );
+};
+
+const canSendPlaySectionOpened = makeCanSendEvent({
+  minimumTimeBetweenEvents: 1000 * 60 * 60 * 2, // Only once every 2 hours.
+});
+
+export const sendPlaySectionOpened = () => {
+  if (!canSendPlaySectionOpened('play-section-opened')) {
+    return;
+  }
+
+  recordEvent('play-section-opened');
+};
+
+export const sendAiRequestStarted = (metadata: {|
+  simplifiedProjectJsonLength: number,
+  projectSpecificExtensionsSummaryJsonLength: number,
+  payWithCredits: boolean,
+  storageProviderName: string | null,
+  mode: string,
+  aiRequestId: string,
+|}) => {
+  recordEvent('ai-request-started', metadata);
+};
+
+export const sendAiRequestMessageSent = (metadata: {|
+  simplifiedProjectJsonLength: number,
+  projectSpecificExtensionsSummaryJsonLength: number,
+  payWithCredits: boolean,
+  mode: string,
+  aiRequestId: string,
+  outputLength: number,
+|}) => {
+  recordEvent('ai-request-message-sent', metadata);
+};
+
+export const sendMcpToolCalled = (metadata: {|
+  toolName: string,
+  clientName: string | null,
+  success: boolean,
+  durationMs: number,
+  // `http`: an agent connected to the opened editor; `stdio`: `--mcp`.
+  transport: 'http' | 'stdio',
+|}) => {
+  recordEvent('mcp-tool-called', metadata);
+};
+
+export const sendMcpAgentConnected = (metadata: {|
+  clientName: string | null,
+  clientVersion: string | null,
+  transport: 'http' | 'stdio',
+  isReadOnly: boolean,
+  // Null for `--mcp`, where the project is the one given in the arguments.
+  hasOpenedProject: boolean | null,
+|}) => {
+  recordEvent('mcp-agent-connected', metadata);
+};
